@@ -29,6 +29,9 @@ class BleManager : public QObject
     // 外设（Peripheral）被其它设备连接的状态
     Q_PROPERTY(bool peripheralConnected READ peripheralConnected
                NOTIFY peripheralConnectedChanged)
+    // 本机系统蓝牙名称（Android 上即广播包中实际广播出去的名称）
+    Q_PROPERTY(QString localDeviceName READ localDeviceName
+               NOTIFY localDeviceNameChanged)
     Q_PROPERTY(BlePermissions *permissions READ permissions CONSTANT)
 
 public:
@@ -38,6 +41,11 @@ public:
     bool advertising() const;
     bool connected() const;
     bool peripheralConnected() const;
+
+    // 本机系统蓝牙名称（Android 上即广播包实际广播出去的名称）
+    QString localDeviceName() const;
+    // 重新读取系统蓝牙名称（授予蓝牙权限后可获取到真实名称）
+    Q_INVOKABLE void refreshLocalDeviceName();
 
     // 返回权限管理对象（QML 通过 bleManager.permissions 访问）
     BlePermissions *permissions() const;
@@ -84,6 +92,8 @@ signals:
     void connectedChanged(bool connected);
     // 外设（Peripheral）被其它设备连接 / 断开
     void peripheralConnectedChanged(bool connected);
+    // 系统蓝牙名称变化
+    void localDeviceNameChanged();
     // 外设（Peripheral）收到已连接设备写入的数据
     void peripheralDataReceived(const QByteArray &data);
     void deviceFound(const QString &name, const QString &address,

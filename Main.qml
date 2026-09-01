@@ -67,7 +67,13 @@ Window {
     // ---------------- 启动自动扫描 ----------------
     // 打开程序进入界面后，蓝牙扫描权限就绪即自动扫描一次：
     // 已有权限 → 直接扫描；未授权 → 自动弹窗申请，授权成功后立即开始扫描
-    Component.onCompleted: autoScanTimer.start()
+    Component.onCompleted: {
+        autoScanTimer.start()
+        // 页面就绪后刷新一次系统蓝牙名称：已有权限时立即显示真实名称，
+        // 未授权时保持占位名，权限授予后由 onPermissionGranted 再次刷新。
+        // （避免在 app 启动早期、权限弹窗前执行蓝牙 JNI，防止首次安装闪退）
+        bleManager.refreshLocalDeviceName()
+    }
     Timer {
         id: autoScanTimer
         interval: 300
@@ -202,8 +208,10 @@ Window {
     // ---- 广播 ----
     function startAdvertise() {
         ensurePermission(BlePermissions.AdvertisePermission, function () {
-            // 名称为空时使用默认名 BLE_SAR；超长截断由 C++ 端完成并回调提示
-            bleManager.startAdvertise(advertNameField.text.trim() || "BLE_SAR",
+            // 广播名称 = 本机系统蓝牙名称：Android 平台广播包名称只能由系统
+            // 填充（即系统蓝牙名，应用内无法自定义），其它平台则以该名称广播；
+            // 名称为空时由 C++ 端回退默认名。超长截断由 C++ 端完成并回调提示。
+            bleManager.startAdvertise(bleManager.localDeviceName,
                                       advertUuidField.text.trim(),
                                       parseInt(advertIntervalField.text, 10) || 100)
         })
@@ -368,8 +376,9 @@ Window {
                 // 过滤（仅扫描页显示）
                 ToolButton {
                     anchors.right: parent.right
-                    anchors.rightMargin: 8
-                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.rightMargin: 124
+                    anchors.bottom: parent.bottom
+                    anchors.bottomMargin: 1
                     implicitWidth: 58
                     implicitHeight: 52
                     onClicked: filterDialog.open()
@@ -379,6 +388,8 @@ Window {
                         Text {
                             text: "⏳"
                             font.pixelSize: 15
+                            height: 20
+                            verticalAlignment: Text.AlignVCenter
                             color: root.filterActive ? root.cAccent : root.cText
                             horizontalAlignment: Text.AlignHCenter
                             anchors.horizontalCenter: parent.horizontalCenter
@@ -396,7 +407,8 @@ Window {
                 ToolButton {
                     anchors.right: parent.right
                     anchors.rightMargin: 66
-                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.bottom: parent.bottom
+                    anchors.bottomMargin: 1
                     implicitWidth: 58
                     implicitHeight: 52
                     onClicked: root.sortDevices()
@@ -406,6 +418,8 @@ Window {
                         Text {
                             text: "⇅"
                             font.pixelSize: 15
+                            height: 20
+                            verticalAlignment: Text.AlignVCenter
                             color: root.cText
                             horizontalAlignment: Text.AlignHCenter
                             anchors.horizontalCenter: parent.horizontalCenter
@@ -422,8 +436,9 @@ Window {
                 // 清除（仅扫描页显示）
                 ToolButton {
                     anchors.right: parent.right
-                    anchors.rightMargin: 124
-                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.rightMargin: 8
+                    anchors.bottom: parent.bottom
+                    anchors.bottomMargin: 1
                     implicitWidth: 58
                     implicitHeight: 52
                     onClicked: root.clearDevices()
@@ -433,6 +448,8 @@ Window {
                         Text {
                             text: "✕"
                             font.pixelSize: 15
+                            height: 20
+                            verticalAlignment: Text.AlignVCenter
                             color: root.cText
                             horizontalAlignment: Text.AlignHCenter
                             anchors.horizontalCenter: parent.horizontalCenter
@@ -811,10 +828,14 @@ Window {
                         id: advertNameField
                         Layout.fillWidth: true
                         height: 36
-                        text: "BLE_SAR"
-                        placeholderText: "BLE_SAR（≤29 字节，超长自动截断）"
+                        // 只读显示本机系统蓝牙名称：Android 广播包中的名称由系统
+                        // 填充（即系统蓝牙名），应用内无法自定义，展示给用户直观对应
+                        readOnly: true
+                        text: bleManager.localDeviceName.length > 0
+                              ? bleManager.localDeviceName : "BLE_SAR"
+                        placeholderText: "BLE_SAR"
                         placeholderTextColor: root.cSubtext
-                        color: root.cText
+                        color: root.cSubtext
                         font.pixelSize: 13
                         background: Rectangle { color: root.cSurface2; radius: 4; border.color: root.cDivider }
                     }
@@ -848,7 +869,7 @@ Window {
                 Text {
                     width: parent.width
                     wrapMode: Text.Wrap
-                    text: qsTr("说明：点击「开始广播」后本机作为真实可连接的 BLE 外设广播（内置 GATT 服务），其它设备可扫描到并连接，连接后可收发数据。广播名称默认 BLE_SAR、可编辑，名称超过 29 字节会自动截断。Service UUID 可留空。")
+                    text: qsTr("说明：点击「开始广播」后本机作为真实可连接的 BLE 外设广播（内置 GATT 服务），其它设备可扫描到并连接，连接后可收发数据。广播名称显示的是本机系统蓝牙名称（Android 平台广播名称即系统蓝牙名，应用内不可修改），如需修改请到手机「设置 → 蓝牙 → 设备名称」中更改。Service UUID 可留空。")
                     color: root.cSubtext
                     font.pixelSize: 12
                 }
@@ -1216,19 +1237,15 @@ Window {
             Column {
                 anchors.centerIn: parent
                 spacing: 8
-                Rectangle {
+                Image {
                     width: 80
                     height: 80
-                    radius: 18
-                    color: root.cAccent
                     anchors.horizontalCenter: parent.horizontalCenter
-                    Text {
-                        anchors.centerIn: parent
-                        text: "B"
-                        color: "white"
-                        font.bold: true
-                        font.pixelSize: 44
-                    }
+                    source: "qrc:/qt/qml/BLE_SAR/icons/tubiao.png"
+                    sourceSize.width: 160
+                    sourceSize.height: 160
+                    fillMode: Image.PreserveAspectFit
+                    antialiasing: true
                 }
                 Text { anchors.horizontalCenter: parent.horizontalCenter; text: "BLE-SAR"; color: root.cText; font.pixelSize: 22; font.bold: true }
                 Text { anchors.horizontalCenter: parent.horizontalCenter; text: "Version 1.0.0"; color: root.cSubtext; font.pixelSize: 13 }
@@ -1594,6 +1611,8 @@ Window {
     Connections {
         target: bleManager.permissions
         function onPermissionGranted() {
+            // 授予权限后刷新系统蓝牙名称（Android 上读取它需要 BLUETOOTH_CONNECT）
+            bleManager.refreshLocalDeviceName()
             if (root.pendingAction) {
                 var act = root.pendingAction
                 root.pendingAction = null

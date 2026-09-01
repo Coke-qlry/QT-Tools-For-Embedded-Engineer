@@ -30,6 +30,8 @@ qt_add_qml_module(appBLE_SAR
     VERSION 1.0
     QML_FILES
         Main.qml
+    RESOURCES
+        icons/tubiao.png
 )
 
 set_target_properties(appBLE_SAR PROPERTIES

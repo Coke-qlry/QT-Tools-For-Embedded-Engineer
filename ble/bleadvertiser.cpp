@@ -13,6 +13,14 @@
 #include <QLowEnergyAdvertisingData>
 #include <QLowEnergyAdvertisingParameters>
 #include <QBluetoothUuid>
+#if defined(Q_OS_ANDROID)
+// Android：直接 JNI 读取系统蓝牙名称（BluetoothAdapter.getName()），
+// 避免构造 QBluetoothLocalDevice 产生的 JNI 广播接收器副作用
+#include <QJniObject>
+#else
+// Linux / macOS / iOS：通过 Qt API 读取本地蓝牙适配器名称
+#include <QBluetoothLocalDevice>
+#endif
 #include <QString>
 #include <QByteArray>
 #include <QtGlobal>
@@ -41,6 +49,9 @@ static QString truncateLocalName(const QString &name)
 BleAdvertiser::BleAdvertiser(QObject *parent)
     : QObject(parent)
 {
+    // 注意：构造阶段不读取系统蓝牙名称。读取需要触发蓝牙 JNI 调用，
+    // 在 app 启动早期（权限弹窗前）执行曾导致 Android 首次安装启动闪退；
+    // 改为由 QML 在页面就绪 / 蓝牙权限授予后调用 refreshLocalDeviceName()。
 #ifdef BLE_ADVERTISING_SUPPORTED
     // 创建外设（Peripheral）控制器，用于 BLE 广播与对外连接
     m_controller = QLowEnergyController::createPeripheral(this);
@@ -114,6 +125,52 @@ bool BleAdvertiser::isSupported() const
     return m_controller != nullptr;
 #else
     return false;
+#endif
+}
+
+QString BleAdvertiser::localDeviceName() const
+{
+    return m_localDeviceName;
+}
+
+void BleAdvertiser::refreshLocalDeviceName()
+{
+#if defined(Q_OS_ANDROID)
+    // Android：通过 JNI 直接读取系统蓝牙名称
+    //   BluetoothAdapter.getDefaultAdapter().getName()
+    // 对应系统「设置 → 蓝牙 → 设备名称」。Android 广播包中的名称只能由系统
+    // 填充（AdvertiseData.Builder 无自定义名称 API，见 Qt 源码
+    // createJavaAdvertiseData 中 setIncludeDeviceName 的逻辑），因此该名称就是
+    // 外部设备实际扫到的广播名称，应用内无法修改，只能引导用户去系统设置改。
+    //
+    // 不使用 QBluetoothLocalDevice::name()：其构造会创建多个 JNI 广播接收器
+    // 并访问系统服务，在蓝牙权限未授予 / app 启动早期存在不稳定风险；
+    // 直接 JNI 只读取一个字符串，无任何副作用，异常由 QJniObject 安全捕获。
+    //
+    // 注意：Android 12+ 的 getName() 需要 BLUETOOTH_CONNECT 权限，未授予时
+    // QJniObject 捕获 SecurityException 并返回空字符串（不会崩溃），此时保持
+    // 当前占位名，等待权限授予后由调用方再次刷新。
+    const QJniObject adapter = QJniObject::callStaticObjectMethod(
+        "android/bluetooth/BluetoothAdapter",
+        "getDefaultAdapter",
+        "()Landroid/bluetooth/BluetoothAdapter;");
+    if (!adapter.isValid())
+        return;
+    const QString name = adapter.callMethod<jstring>("getName").toString();
+    qDebug()<<"The BLE Name:"<<name;
+    if (!name.isEmpty() && name != m_localDeviceName) {
+        m_localDeviceName = name;
+        emit localDeviceNameChanged();
+    }
+#elif defined(BLE_ADVERTISING_SUPPORTED)
+    // Linux / macOS / iOS：读取本地蓝牙适配器名称
+    const QString name = QBluetoothLocalDevice().name();
+    if (!name.isEmpty() && name != m_localDeviceName) {
+        m_localDeviceName = name;
+        emit localDeviceNameChanged();
+    }
+#else
+    // Windows 桌面版不支持外设广播，无系统蓝牙名可读，保持默认占位名
 #endif
 }
 
@@ -228,11 +285,13 @@ void BleAdvertiser::startAdvertise(const QString &localName,
     }
 
     // ---- 2. 广播名称（真实广播名称 / Complete Local Name）----
-    // 广播名称是可修改的：UI 传入的 localName 会作为实际广播出去的设备名称，
-    // 扫描端（如 nRF Connect）看到的 "Complete Local Name" 即为此值。
-    // 名称为空时回退到默认名，保证扫描端始终能识别到名称。
+    // Android 平台限制：广播包名称只能由系统填充（即系统蓝牙名称，见
+    // refreshLocalDeviceName() 注释），此处传入的 localName 会被忽略；
+    // Linux / macOS / iOS 平台则以该名称真实广播。
+    // 调用方此时已确认蓝牙权限，重新读取系统蓝牙名以保证最新值。
+    refreshLocalDeviceName();
     const QString name = localName.trimmed().isEmpty()
-                             ? QStringLiteral("BLE_SAR")
+                             ? m_localDeviceName
                              : localName.trimmed();
     const QString safeName = truncateLocalName(name);
     if (safeName != name) {

@@ -35,6 +35,9 @@ BleManager::BleManager(QObject *parent)
             this, &BleManager::peripheralConnectedChanged);
     connect(m_advertiser, &BleAdvertiser::dataReceived,
             this, &BleManager::peripheralDataReceived);
+    // 系统蓝牙名称变化（Android 上即广播实际名称）
+    connect(m_advertiser, &BleAdvertiser::localDeviceNameChanged,
+            this, &BleManager::localDeviceNameChanged);
 
     // 连接模块信号转发
     connect(m_connection, &BleConnection::connectedChanged,
@@ -69,6 +72,17 @@ bool BleManager::connected() const
 bool BleManager::peripheralConnected() const
 {
     return m_advertiser->isConnected();
+}
+
+QString BleManager::localDeviceName() const
+{
+    return m_advertiser ? m_advertiser->localDeviceName() : QString();
+}
+
+void BleManager::refreshLocalDeviceName()
+{
+    if (m_advertiser)
+        m_advertiser->refreshLocalDeviceName();
 }
 
 BlePermissions *BleManager::permissions() const

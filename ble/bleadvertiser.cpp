@@ -4,17 +4,45 @@
 // Qt 6.10：外设广播通过 QLowEnergyController 的 Peripheral 角色实现。
 // QLowEnergyAdvertisingManager 类在 Qt 6.10 中已移除。
 #include <QLowEnergyController>
+#include <QLowEnergyService>
+#include <QLowEnergyServiceData>
+#include <QLowEnergyCharacteristic>
+#include <QLowEnergyCharacteristicData>
+#include <QLowEnergyDescriptor>
+#include <QLowEnergyDescriptorData>
 #include <QLowEnergyAdvertisingData>
 #include <QLowEnergyAdvertisingParameters>
 #include <QBluetoothUuid>
+#include <QString>
+#include <QByteArray>
 #include <QtGlobal>
 #endif
+
+// ---------------------------------------------------------------------
+// 将广播名称按 UTF-8 字节安全截断到 BLE Local Name 字段上限（29 字节）。
+// BLE 广播报文一个 AD Structure 最多 31 字节，Local Name 字段本身上限为
+// 29 字节（31 - 2 字节的长度/类型头）。超长时按 UTF-8 边界截断，避免把
+// 多字节字符（如中文）从中切开形成乱码。
+// ---------------------------------------------------------------------
+static QString truncateLocalName(const QString &name)
+{
+    QByteArray utf8 = name.toUtf8();
+    if (utf8.size() <= 29)
+        return name;
+
+    // 从第 29 字节处向左回退，直到落在合法的 UTF-8 起始字节上
+    int cut = 29;
+    while (cut > 0 && (static_cast<unsigned char>(utf8.at(cut)) & 0xC0) == 0x80)
+        --cut;          // 跳过续字节
+    utf8.truncate(cut);
+    return QString::fromUtf8(utf8);
+}
 
 BleAdvertiser::BleAdvertiser(QObject *parent)
     : QObject(parent)
 {
 #ifdef BLE_ADVERTISING_SUPPORTED
-    // 创建外设（Peripheral）控制器，用于 BLE 广播
+    // 创建外设（Peripheral）控制器，用于 BLE 广播与对外连接
     m_controller = QLowEnergyController::createPeripheral(this);
 
     // 广播状态变化：AdvertisingState 表示广播中
@@ -25,6 +53,22 @@ BleAdvertiser::BleAdvertiser(QObject *parent)
                 if (advertising != m_advertising) {
                     m_advertising = advertising;
                     emit advertisingChanged(advertising);
+                }
+            });
+
+    // 外设被连接 / 断开
+    connect(m_controller, &QLowEnergyController::connected,
+            this, [this]() {
+                if (!m_connected) {
+                    m_connected = true;
+                    emit connectedChanged(true);
+                }
+            });
+    connect(m_controller, &QLowEnergyController::disconnected,
+            this, [this]() {
+                if (m_connected) {
+                    m_connected = false;
+                    emit connectedChanged(false);
                 }
             });
 
@@ -40,9 +84,19 @@ BleAdvertiser::BleAdvertiser(QObject *parent)
 #endif
 }
 
+BleAdvertiser::~BleAdvertiser()
+{
+    stopAdvertise();
+}
+
 bool BleAdvertiser::isAdvertising() const
 {
     return m_advertising;
+}
+
+bool BleAdvertiser::isConnected() const
+{
+    return m_connected;
 }
 
 bool BleAdvertiser::isSupported() const
@@ -54,6 +108,56 @@ bool BleAdvertiser::isSupported() const
     return false;
 #endif
 }
+
+#ifdef BLE_ADVERTISING_SUPPORTED
+void BleAdvertiser::setupGattService(const QBluetoothUuid &serviceUuid)
+{
+    // ---- 构建 SAR 数据服务 ----
+    // 含一个特征（Characteristic），支持：读（Central 主动读取）、
+    // 写（Central 下发控制指令）、通知（外设主动上报 SAR 数据）。
+    // 特征 UUID：0x2A46（Generic Data）
+    const QBluetoothUuid charUuid(
+        QStringLiteral("00002a46-0000-1000-8000-00805f9b34fb"));
+
+    QLowEnergyCharacteristicData charData;
+    charData.setUuid(charUuid);
+    charData.setProperties(QLowEnergyCharacteristic::Read
+                           | QLowEnergyCharacteristic::Write
+                           | QLowEnergyCharacteristic::Notify);
+    charData.setValue(QByteArray("BLE SAR")); // 初始可读值
+
+    // 使能“通知”所需的 CCCD（Client Characteristic Configuration Descriptor）
+    // UUID：0x2902
+    QLowEnergyDescriptorData cccd(
+        QBluetoothUuid(QStringLiteral(
+            "00002902-0000-1000-8000-00805f9b34fb")),
+        QByteArray(2, 0));
+    charData.addDescriptor(cccd);
+
+    QLowEnergyServiceData serviceData;
+    serviceData.setType(QLowEnergyServiceData::ServiceTypePrimary);
+    serviceData.setUuid(serviceUuid);
+    serviceData.addCharacteristic(charData);
+
+    m_sarService = m_controller->addService(serviceData);
+    if (!m_sarService)
+        return;
+
+    // 记录可操作特征句柄
+    const QList<QLowEnergyCharacteristic> chars =
+        m_sarService->characteristics();
+    if (!chars.isEmpty())
+        m_sarChar = chars.first();
+
+    // Central 写入特征（外设端收到写请求）
+    connect(m_sarService, &QLowEnergyService::characteristicWritten,
+            this, [this, charUuid](const QLowEnergyCharacteristic &info,
+                                   const QByteArray &value) {
+                if (info.isValid() && info.uuid() == charUuid)
+                    emit dataReceived(value);
+            });
+}
+#endif
 
 void BleAdvertiser::startAdvertise(const QString &localName,
                                    const QString &serviceUuid,
@@ -67,32 +171,74 @@ void BleAdvertiser::startAdvertise(const QString &localName,
     if (m_controller->state() == QLowEnergyController::AdvertisingState)
         m_controller->stopAdvertising();
 
-    // ---- 广播数据 ----
+    // ---- 1. 建立真实可连接的 GATT 服务层（必须先于广播） ----
+    // 关键：BLE 外设若要被扫描到并“可连接”，必须在 startAdvertising()
+    // 之前 addService() 添加至少一个有效的 GATT 服务。没有服务层时，
+    // Android 系统可能无法正常进入广播状态，或广播但不携带服务信息，
+    // 这正是“其他设备扫不到本设备”的常见根因之一。
+    QBluetoothUuid uuid;
+    if (!serviceUuid.isEmpty()) {
+        uuid = QBluetoothUuid::fromString(serviceUuid);
+        if (uuid.isNull())
+            // 0x180C Generic Data 服务兜底
+            uuid = QBluetoothUuid(
+                QStringLiteral("0000180c-0000-1000-8000-00805f9b34fb"));
+    } else {
+        uuid = QBluetoothUuid(
+            QStringLiteral("0000180c-0000-1000-8000-00805f9b34fb"));
+    }
+    setupGattService(uuid);
+
+    // ---- 2. 广播名称（真实广播名称 / Complete Local Name）----
+    // 广播名称是可修改的：UI 传入的 localName 会作为实际广播出去的设备名称，
+    // 扫描端（如 nRF Connect）看到的 "Complete Local Name" 即为此值。
+    // 名称为空时回退到默认名，保证扫描端始终能识别到名称。
+    const QString name = localName.trimmed().isEmpty()
+                             ? QStringLiteral("BLE_SAR")
+                             : localName.trimmed();
+    const QString safeName = truncateLocalName(name);
+    if (safeName != name) {
+        emit errorOccurred(
+            QStringLiteral("广播名称过长（%1 字节 > 29 字节），"
+                           "已自动截断为“%2”")
+                .arg(name.toUtf8().size()).arg(safeName));
+    }
+
+    // ---- 3. 主广播包数据 ----
+    // 主广播包仅有 31 字节，优先放入服务 UUID 与标志位（保证可被识别/连接）。
+    // 128-bit UUID 时剩余空间有限，名称放不下的部分交给扫描响应包承载。
     QLowEnergyAdvertisingData data;
     data.setDiscoverability(
         QLowEnergyAdvertisingData::DiscoverabilityGeneral);
-    if (!localName.isEmpty())
-        data.setLocalName(localName);
     data.setIncludePowerLevel(true);
-    if (!serviceUuid.isEmpty()) {
-        const QBluetoothUuid uuid = QBluetoothUuid::fromString(serviceUuid);
-        if (!uuid.isNull())
-            data.setServices({uuid});
-    }
+    data.setServices({uuid});
 
-    // ---- 广播参数 ----
-    // setMode 取值：AdvInd(可连接)/AdvScanInd(可扫描)/AdvNonConnInd(不可连接)。
-    // SAR 外设仅上报数据、无需被连接，使用不可连接广播 AdvNonConnInd。
+    // 若主广播包剩余空间足够，也把名称一并放入（如 16-bit UUID 场景）；
+    // 空间不足时名称仅存在于扫描响应，扫描端合并后仍显示完整名称。
+    // 31 = Flags(3) + TxPower(3) + UUID AD(2+len) + Name AD(2+len)
+    const int uuidAdBytes = 2 + static_cast<int>(uuid.minimumSize());
+    const int nameCapacity = 31 - 3 - 3 - uuidAdBytes - 2;
+    if (nameCapacity >= safeName.toUtf8().size())
+        data.setLocalName(safeName);
+
+    // ---- 4. 扫描响应数据：完整广播名称 ----
+    // 与 nRF Connect 广播配置一致：名称作为 "Complete Local Name" 广播，
+    // 扫描端合并主广播包 + 扫描响应后，显示的名称即为我们设置的广播名称。
+    QLowEnergyAdvertisingData scanResponseData;
+    scanResponseData.setLocalName(safeName);
+
+    // ---- 5. 广播参数 ----
+    // 使用 AdvInd（可连接广播）：这是 createPeripheral() 的典型场景，
+    // 允许 Central 设备扫描到并连接我们的外设。AdvNonConnInd（不可连接）
+    // 在 Android 上支持有限且部分扫描器读不到名称，故不使用。
     QLowEnergyAdvertisingParameters parameters;
-    parameters.setMode(QLowEnergyAdvertisingParameters::AdvNonConnInd);
+    parameters.setMode(QLowEnergyAdvertisingParameters::AdvInd);
     // setInterval(minimum, maximum) 单位 0.625ms，合法范围 20ms ~ 10240ms。
-    // 为简化，最小/最大间隔设为相同值。
     const int clamped = qBound(20, intervalMs > 0 ? intervalMs : 100, 10240);
     const quint16 ticks = static_cast<quint16>(clamped * 8 / 5);
     parameters.setInterval(ticks, ticks);
 
-    m_controller->startAdvertising(parameters, data,
-                                   QLowEnergyAdvertisingData());
+    m_controller->startAdvertising(parameters, data, scanResponseData);
 #else
     Q_UNUSED(localName)
     Q_UNUSED(serviceUuid)
@@ -115,5 +261,17 @@ void BleAdvertiser::stopAdvertise()
         m_advertising = false;
         emit advertisingChanged(false);
     }
+#endif
+}
+
+void BleAdvertiser::sendData(const QByteArray &data)
+{
+#ifdef BLE_ADVERTISING_SUPPORTED
+    // 仅当有 Central 设备连接且特征有效时下发
+    if (!m_connected || !m_sarChar.isValid() || !m_sarService)
+        return;
+    m_sarService->writeCharacteristic(m_sarChar, data);
+#else
+    Q_UNUSED(data)
 #endif
 }

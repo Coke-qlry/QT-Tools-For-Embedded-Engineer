@@ -35,8 +35,19 @@ Window {
     property int currentTab: 0          // 0=扫描 1=广播 2=关于
     property bool scanning: false       // 由 bleManager.scanningChanged 驱动
     property bool advertising: false    // 由 bleManager.advertisingChanged 驱动
+    property bool peripheralConnected: false // 外设被其它设备连接状态
     property int lastFound: -1          // 指令查找的起始游标
     property bool sortByName: false     // true=按名称排序，false=按RSSI排序
+
+    // ---------------- 启动自动扫描 ----------------
+    // 打开程序进入界面后，蓝牙扫描权限就绪即自动扫描一次：
+    // 已有权限 → 直接扫描；未授权 → 自动弹窗申请，授权成功后立即开始扫描
+    Component.onCompleted: autoScanTimer.start()
+    Timer {
+        id: autoScanTimer
+        interval: 300
+        onTriggered: root.startScan()
+    }
 
     // =================================================================
     // 主界面功能接口（调用 C++ 后端 bleManager）
@@ -72,7 +83,9 @@ Window {
         for (var i = 0; i < deviceModel.count; i++) arr.push(deviceModel.get(i))
         arr.sort(function (a, b) {
             if (sortByName) {
-                var na = (a.name || "").toLowerCase(), nb = (b.name || "").toLowerCase()
+                // N/A 视为空名称，排序时排最后
+                var na = (a.name === "N/A" ? "" : (a.name || "")).toLowerCase()
+                var nb = (b.name === "N/A" ? "" : (b.name || "")).toLowerCase()
                 if (na === nb) return b.rssi - a.rssi
                 if (na === "") return 1
                 if (nb === "") return -1
@@ -98,7 +111,8 @@ Window {
 
     function startAdvertise() {
         ensurePermission(BlePermissions.AdvertisePermission, function () {
-            bleManager.startAdvertise(advertNameField.text.trim() || "BLE SAR",
+            // 名称为空时使用默认名 BLE_SAR；超长截断由 C++ 端完成并回调提示
+            bleManager.startAdvertise(advertNameField.text.trim() || "BLE_SAR",
                                       advertUuidField.text.trim(),
                                       parseInt(advertIntervalField.text, 10) || 100)
         })
@@ -190,7 +204,7 @@ Window {
         showToast("已删除选中指令")
     }
 
-    // 删除按钮：长按 3 秒删全部
+    // 删除按钮：长按 2 秒删全部
     function deleteAllCommands() {
         instructionModel.clear()
         commandList.currentIndex = -1
@@ -465,21 +479,43 @@ Window {
                     font.pixelSize: 20
                     font.bold: true
                 }
-                // 广播状态指示
-                Row {
-                    spacing: 8
-                    Rectangle {
-                        width: 10
-                        height: 10
-                        radius: 5
-                        color: root.advertising ? root.cGreen : root.cSubtext
-                        anchors.verticalCenter: parent.verticalCenter
+                // 广播状态指示 + 外设连接状态
+                Column {
+                    width: parent.width
+                    spacing: 6
+                    Row {
+                        spacing: 8
+                        Rectangle {
+                            width: 10
+                            height: 10
+                            radius: 5
+                            color: root.advertising ? root.cGreen : root.cSubtext
+                            anchors.verticalCenter: parent.verticalCenter
+                        }
+                        Text {
+                            text: root.advertising ? "正在广播 (Advertising)" : "未广播 (Idle)"
+                            color: root.advertising ? root.cGreen : root.cSubtext
+                            font.pixelSize: 13
+                            anchors.verticalCenter: parent.verticalCenter
+                        }
                     }
-                    Text {
-                        text: root.advertising ? "正在广播 (Advertising)" : "未广播 (Idle)"
-                        color: root.advertising ? root.cGreen : root.cSubtext
-                        font.pixelSize: 13
-                        anchors.verticalCenter: parent.verticalCenter
+                    Row {
+                        spacing: 8
+                        visible: root.advertising   // 仅在广播中显示连接状态
+                        Rectangle {
+                            width: 10
+                            height: 10
+                            radius: 5
+                            color: root.peripheralConnected ? root.cGreen : root.cSubtext
+                            anchors.verticalCenter: parent.verticalCenter
+                        }
+                        Text {
+                            text: root.peripheralConnected
+                                  ? "已连接：可收发数据" : "等待其它设备连接…"
+                            color: root.peripheralConnected ? root.cGreen : root.cSubtext
+                            font.pixelSize: 13
+                            anchors.verticalCenter: parent.verticalCenter
+                        }
                     }
                 }
                 Rectangle {
@@ -511,7 +547,8 @@ Window {
                         id: advertNameField
                         Layout.fillWidth: true
                         height: 36
-                        placeholderText: "BLE SAR"
+                        text: "BLE_SAR"
+                        placeholderText: "BLE_SAR（≤29 字节，超长自动截断）"
                         placeholderTextColor: root.cSubtext
                         color: root.cText
                         font.pixelSize: 13
@@ -547,7 +584,7 @@ Window {
                 Text {
                     width: parent.width
                     wrapMode: Text.Wrap
-                    text: qsTr("说明：点击「开始广播」将调用 bleManager.startAdvertise(name, uuid, interval) 发起广播；开启广播后本机可被其它设备扫描到。Service UUID 可留空。")
+                    text: qsTr("说明：点击「开始广播」后本机作为真实可连接的 BLE 外设广播（内置 GATT 服务），其它设备可扫描到并连接，连接后可收发数据。广播名称默认 BLE_SAR、可编辑，名称超过 29 字节会自动截断。Service UUID 可留空。")
                     color: root.cSubtext
                     font.pixelSize: 12
                 }
@@ -575,9 +612,9 @@ Window {
                         font.pixelSize: 44
                     }
                 }
-                Text { anchors.horizontalCenter: parent.horizontalCenter; text: "BLE SAR"; color: root.cText; font.pixelSize: 22; font.bold: true }
-                Text { anchors.horizontalCenter: parent.horizontalCenter; text: "Version 0.1.0"; color: root.cSubtext; font.pixelSize: 13 }
-                Text { anchors.horizontalCenter: parent.horizontalCenter; text: "仿 nRF Connect 界面风格 · 中文版"; color: root.cSubtext; font.pixelSize: 13 }
+                Text { anchors.horizontalCenter: parent.horizontalCenter; text: "BLE-SAR"; color: root.cText; font.pixelSize: 22; font.bold: true }
+                Text { anchors.horizontalCenter: parent.horizontalCenter; text: "Version 1.0.0"; color: root.cSubtext; font.pixelSize: 13 }
+                Text { anchors.horizontalCenter: parent.horizontalCenter; text: "做您最舒心的蓝牙调试助手"; color: root.cSubtext; font.pixelSize: 13 }
             }
         }
 
@@ -735,8 +772,24 @@ Window {
                 contentItem: Column {
                     spacing: 2
                     anchors.centerIn: parent
-                    Text { text: "＋"; font.pixelSize: 15; color: root.cAccent; horizontalAlignment: Text.AlignHCenter; anchors.horizontalCenter: parent.horizontalCenter }
-                    Text { text: "增(Add)"; font.pixelSize: 9; color: root.cText; horizontalAlignment: Text.AlignHCenter; anchors.horizontalCenter: parent.horizontalCenter }
+                    Text {
+                        text: "＋"
+                        width: 60
+                        height: 18
+                        font.pixelSize: 15
+                        color: root.cAccent
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    Text {
+                        text: "增(Add)"
+                        width: 60
+                        height: 12
+                        font.pixelSize: 9
+                        color: root.cText
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
                 }
             }
             ToolButton {
@@ -750,8 +803,24 @@ Window {
                 contentItem: Column {
                     spacing: 2
                     anchors.centerIn: parent
-                    Text { text: "✎"; font.pixelSize: 15; color: root.cAccent; horizontalAlignment: Text.AlignHCenter; anchors.horizontalCenter: parent.horizontalCenter }
-                    Text { text: "改(Edit)"; font.pixelSize: 9; color: root.cText; horizontalAlignment: Text.AlignHCenter; anchors.horizontalCenter: parent.horizontalCenter }
+                    Text {
+                        text: "✎"
+                        width: 60
+                        height: 18
+                        font.pixelSize: 15
+                        color: root.cAccent
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    Text {
+                        text: "改(Edit)"
+                        width: 60
+                        height: 12
+                        font.pixelSize: 9
+                        color: root.cText
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
                 }
             }
             ToolButton {
@@ -762,7 +831,7 @@ Window {
                 implicitWidth: 60
                 implicitHeight: 52
 
-                // 长按 3 秒 = 全部删除；短按 = 删除选中
+                // 长按 2 秒 = 全部删除；短按 = 删除选中
                 onPressed: {
                     delHoldTimer.restart()
                     delBtn.colorOverlay = true
@@ -779,7 +848,7 @@ Window {
 
                 Timer {
                     id: delHoldTimer
-                    interval: 3000
+                    interval: 2000
                     onTriggered: {
                         delBtn.colorOverlay = false
                         root.deleteAllCommands()
@@ -788,12 +857,28 @@ Window {
                 contentItem: Column {
                     spacing: 2
                     anchors.centerIn: parent
-                    Text { text: "🗑"; font.pixelSize: 15; color: delBtn.colorOverlay ? root.cRed : root.cText; horizontalAlignment: Text.AlignHCenter; anchors.horizontalCenter: parent.horizontalCenter }
-                    Text { text: "删(Del)"; font.pixelSize: 9; color: root.cText; horizontalAlignment: Text.AlignHCenter; anchors.horizontalCenter: parent.horizontalCenter }
+                    Text {
+                        text: "🗑"
+                        width: 60
+                        height: 18
+                        font.pixelSize: 15
+                        color: delBtn.colorOverlay ? root.cRed : root.cText
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    Text {
+                        text: "删(Del)"
+                        width: 60
+                        height: 12
+                        font.pixelSize: 9
+                        color: root.cText
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
                 }
                 ToolTip.visible: delBtn.hovered
                 ToolTip.delay: 600
-                ToolTip.text: "短按: 删除选中指令\n长按3秒: 删除全部指令"
+                ToolTip.text: "短按: 删除选中指令\n长按2秒: 删除全部指令"
             }
             ToolButton {
                 id: findBtn
@@ -806,8 +891,24 @@ Window {
                 contentItem: Column {
                     spacing: 2
                     anchors.centerIn: parent
-                    Text { text: "🔍"; font.pixelSize: 15; color: root.cAccent; horizontalAlignment: Text.AlignHCenter; anchors.horizontalCenter: parent.horizontalCenter }
-                    Text { text: "查(Find)"; font.pixelSize: 9; color: root.cText; horizontalAlignment: Text.AlignHCenter; anchors.horizontalCenter: parent.horizontalCenter }
+                    Text {
+                        text: "🔍"
+                        width: 60
+                        height: 18
+                        font.pixelSize: 15
+                        color: root.cAccent
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    Text {
+                        text: "查(Find)"
+                        width: 60
+                        height: 12
+                        font.pixelSize: 9
+                        color: root.cText
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
                 }
             }
         }
@@ -1081,6 +1182,20 @@ Window {
         function onAdvertisingChanged(v) {
             root.advertising = v
             root.showToast(v ? "正在广播" : "已停止广播")
+            if (!v) root.peripheralConnected = false
+        }
+        // 外设被其它设备连接 / 断开
+        function onPeripheralConnectedChanged(v) {
+            root.peripheralConnected = v
+            root.showToast(v ? "有设备已连接，可收发数据" : "设备已断开连接")
+        }
+        // 外设收到已连接设备写入的数据
+        function onPeripheralDataReceived(data) {
+            root.showToast("收到数据: " + String(data))
+        }
+        // 广播 / 扫描 / 连接 错误或提示（含广播名称截断提示）
+        function onErrorOccurred(message) {
+            root.showToast(message)
         }
         function onConnectedChanged(v) {
             // 依据连接状态更新设备列表对应行

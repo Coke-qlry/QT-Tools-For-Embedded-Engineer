@@ -26,6 +26,9 @@ class BleManager : public QObject
     Q_PROPERTY(bool scanning READ scanning NOTIFY scanningChanged)
     Q_PROPERTY(bool advertising READ advertising NOTIFY advertisingChanged)
     Q_PROPERTY(bool connected READ connected NOTIFY connectedChanged)
+    // 外设（Peripheral）被其它设备连接的状态
+    Q_PROPERTY(bool peripheralConnected READ peripheralConnected
+               NOTIFY peripheralConnectedChanged)
     Q_PROPERTY(BlePermissions *permissions READ permissions CONSTANT)
 
 public:
@@ -34,6 +37,7 @@ public:
     bool scanning() const;
     bool advertising() const;
     bool connected() const;
+    bool peripheralConnected() const;
 
     // 返回权限管理对象（QML 通过 bleManager.permissions 访问）
     BlePermissions *permissions() const;
@@ -51,10 +55,12 @@ public:
 
     // ---- 广播 ----
     Q_INVOKABLE void startAdvertise(
-        const QString &localName = QStringLiteral("BLE SAR"),
+        const QString &localName = QStringLiteral("BLE_SAR"),
         const QString &serviceUuid = QString(),
         int intervalMs = 100);
     Q_INVOKABLE void stopAdvertise();
+    // 外设（Peripheral）角色：向已连接设备下发数据 / 读取通知数据
+    Q_INVOKABLE void sendPeripheralData(const QByteArray &data);
 
     // ---- GATT 连接 ----
     Q_INVOKABLE void connectToDevice(const QString &address);
@@ -76,6 +82,10 @@ signals:
     void scanningChanged(bool scanning);
     void advertisingChanged(bool advertising);
     void connectedChanged(bool connected);
+    // 外设（Peripheral）被其它设备连接 / 断开
+    void peripheralConnectedChanged(bool connected);
+    // 外设（Peripheral）收到已连接设备写入的数据
+    void peripheralDataReceived(const QByteArray &data);
     void deviceFound(const QString &name, const QString &address,
                      int rssi, bool isLe);
     void scanFinished();

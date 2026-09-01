@@ -30,6 +30,11 @@ BleManager::BleManager(QObject *parent)
             this, &BleManager::advertisingChanged);
     connect(m_advertiser, &BleAdvertiser::errorOccurred,
             this, &BleManager::errorOccurred);
+    // 外设（Peripheral）被连接 / 收到数据
+    connect(m_advertiser, &BleAdvertiser::connectedChanged,
+            this, &BleManager::peripheralConnectedChanged);
+    connect(m_advertiser, &BleAdvertiser::dataReceived,
+            this, &BleManager::peripheralDataReceived);
 
     // 连接模块信号转发
     connect(m_connection, &BleConnection::connectedChanged,
@@ -59,6 +64,11 @@ bool BleManager::advertising() const
 bool BleManager::connected() const
 {
     return m_connection->isConnected();
+}
+
+bool BleManager::peripheralConnected() const
+{
+    return m_advertiser->isConnected();
 }
 
 BlePermissions *BleManager::permissions() const
@@ -122,6 +132,11 @@ void BleManager::startAdvertise(const QString &localName,
 void BleManager::stopAdvertise()
 {
     m_advertiser->stopAdvertise();
+}
+
+void BleManager::sendPeripheralData(const QByteArray &data)
+{
+    m_advertiser->sendData(data);
 }
 
 // ---- GATT 连接 ----

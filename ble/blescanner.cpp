@@ -26,6 +26,13 @@ bool isLeDevice(const QBluetoothDeviceInfo &info)
         .testFlag(QBluetoothDeviceInfo::LowEnergyCoreConfiguration);
 }
 
+// 设备展示名：没有广播名称 / 无法识别的设备，统一显示为 N/A，不留空白
+QString displayName(const QBluetoothDeviceInfo &info)
+{
+    const QString name = info.name();
+    return name.trimmed().isEmpty() ? QStringLiteral("N/A") : name;
+}
+
 } // namespace
 
 BleScanner::BleScanner(QObject *parent)
@@ -58,7 +65,7 @@ QList<BleScanner::DeviceEntry> BleScanner::devices() const
     entries.reserve(m_infos.size());
     for (const QBluetoothDeviceInfo &info : m_infos) {
         DeviceEntry e;
-        e.name = info.name();
+        e.name = displayName(info);
         e.address = deviceAddressString(info);
         e.rssi = info.rssi();
         e.isLe = isLeDevice(info);
@@ -113,7 +120,7 @@ void BleScanner::onDeviceDiscovered(const QBluetoothDeviceInfo &info)
     }
 
     m_infos.append(info);
-    emit deviceFound(info.name(), address, info.rssi(), isLeDevice(info));
+    emit deviceFound(displayName(info), address, info.rssi(), isLeDevice(info));
 }
 
 void BleScanner::onScanFinished()

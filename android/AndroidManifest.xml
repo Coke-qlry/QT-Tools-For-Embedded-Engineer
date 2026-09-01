@@ -1,35 +1,19 @@
-<?xml version="1.0"?>
-<!--
-    Android 自定义 Manifest：声明 BLE 所需权限。
-    Qt 构建系统会将该文件与默认模板合并（%%PLACEHOLDER%% 由构建系统填充）。
-    Android 12 (API 31) 起需动态申请 BLUETOOTH_SCAN / BLUETOOTH_CONNECT /
-    BLUETOOTH_ADVERTISE；Qt 6.5+ 的 QtBluetooth 会自动请求权限。
--->
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="org.qtproject.example.appBLE_SAR"
-    android:versionName="-- %%INSERT_VERSION_NAME%% --"
-    android:versionCode="-- %%INSERT_VERSION_CODE%% --">
-
-    <uses-sdk android:minSdkVersion="23"
-        android:targetSdkVersion="-- %%INSERT_TARGET_SDK%% --" />
-
-    <!-- Android 11 及以下：经典蓝牙权限 -->
-    <uses-permission android:name="android.permission.BLUETOOTH"
-        android:maxSdkVersion="30" />
-    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"
-        android:maxSdkVersion="30" />
-    <!-- Android 12+：细分的 BLE 权限 -->
-    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
-        android:usesPermissionFlags="neverForLocation" />
-    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
-    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
-    <!-- 低版本 Android 扫描 BLE 需要定位权限 -->
-    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
-
-    <application
-        android:label="-- %%INSERT_APP_NAME%% --"
-        android:name="org.qtproject.qt.android.bindings.QtApplication"
-        android:allowBackup="true"
-        android:hardwareAccelerated="true">
+<?xml version='1.0'?>
+<manifest android:installLocation="auto" android:versionCode="-- %%INSERT_VERSION_CODE%% --" android:versionName="-- %%INSERT_VERSION_NAME%% --" package="org.qtproject.example" xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- %%INSERT_PERMISSIONS -->
+    <supports-screens android:anyDensity="true" android:largeScreens="true" android:normalScreens="true" android:smallScreens="true"/>
+    <!--%%INSERT_FEATURES-->
+    <application android:allowBackup="true" android:enableOnBackInvokedCallback="false" android:fullBackupOnly="false" android:hardwareAccelerated="true" android:icon="@drawable/icon" android:label="-- %%INSERT_APP_NAME%% --" android:name="org.qtproject.qt.android.bindings.QtApplication" android:requestLegacyExternalStorage="true">
+        <activity android:configChanges="orientation|uiMode|screenLayout|screenSize|smallestScreenSize|layoutDirection|locale|fontScale|keyboard|keyboardHidden|navigation|mcc|mnc|density" android:exported="true" android:label="-- %%INSERT_APP_NAME%% --" android:launchMode="singleTop" android:name="org.qtproject.qt.android.bindings.QtActivity" android:screenOrientation="unspecified">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+            <meta-data android:name="android.app.lib_name" android:value="-- %%INSERT_APP_LIB_NAME%% --"/>
+            <meta-data android:name="android.app.arguments" android:value="-- %%INSERT_APP_ARGUMENTS%% --"/>
+        </activity>
+        <provider android:authorities="${applicationId}.qtprovider" android:exported="false" android:grantUriPermissions="true" android:name="androidx.core.content.FileProvider">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/qtprovider_paths"/>
+        </provider>
     </application>
 </manifest>

@@ -44,7 +44,14 @@ BleAdvertiser::BleAdvertiser(QObject *parent)
 #ifdef BLE_ADVERTISING_SUPPORTED
     // 创建外设（Peripheral）控制器，用于 BLE 广播与对外连接
     m_controller = QLowEnergyController::createPeripheral(this);
+    if (m_controller)
+        setupControllerConnections();
+#endif
+}
 
+#ifdef BLE_ADVERTISING_SUPPORTED
+void BleAdvertiser::setupControllerConnections()
+{
     // 广播状态变化：AdvertisingState 表示广播中
     connect(m_controller, &QLowEnergyController::stateChanged,
             this, [this](QLowEnergyController::ControllerState state) {
@@ -79,10 +86,11 @@ BleAdvertiser::BleAdvertiser(QObject *parent)
                     return;
                 emit errorOccurred(
                     QStringLiteral("BLE 外设错误: %1")
-                        .arg(m_controller->errorString()));
+                        .arg(m_controller ? m_controller->errorString()
+                                          : QStringLiteral("未知错误")));
             });
-#endif
 }
+#endif
 
 BleAdvertiser::~BleAdvertiser()
 {
@@ -168,6 +176,20 @@ void BleAdvertiser::startAdvertise(const QString &localName,
         emit errorOccurred(QStringLiteral("无法创建 BLE 外设控制器"));
         return;
     }
+
+    // 解析服务 UUID（无效则回退 Generic Data 0x180C 兜底）
+    QBluetoothUuid uuid;
+    if (!serviceUuid.isEmpty()) {
+        uuid = QBluetoothUuid::fromString(serviceUuid);
+        if (uuid.isNull())
+            uuid = QBluetoothUuid(
+                QStringLiteral("0000180c-0000-1000-8000-00805f9b34fb"));
+    } else {
+        uuid = QBluetoothUuid(
+            QStringLiteral("0000180c-0000-1000-8000-00805f9b34fb"));
+    }
+
+    // 已在广播则先停止（广播名称 / 参数可随时更新）
     if (m_controller->state() == QLowEnergyController::AdvertisingState)
         m_controller->stopAdvertising();
 
@@ -176,18 +198,34 @@ void BleAdvertiser::startAdvertise(const QString &localName,
     // 之前 addService() 添加至少一个有效的 GATT 服务。没有服务层时，
     // Android 系统可能无法正常进入广播状态，或广播但不携带服务信息，
     // 这正是“其他设备扫不到本设备”的常见根因之一。
-    QBluetoothUuid uuid;
-    if (!serviceUuid.isEmpty()) {
-        uuid = QBluetoothUuid::fromString(serviceUuid);
-        if (uuid.isNull())
-            // 0x180C Generic Data 服务兜底
-            uuid = QBluetoothUuid(
-                QStringLiteral("0000180c-0000-1000-8000-00805f9b34fb"));
-    } else {
-        uuid = QBluetoothUuid(
-            QStringLiteral("0000180c-0000-1000-8000-00805f9b34fb"));
+    //
+    // 注意：QLowEnergyController 不提供移除已添加服务的接口，若服务 UUID
+    // 变化时仍重复 addService()，会堆积多个服务对象造成资源泄漏。
+    // 因此仅在 UUID 变化时重建整个控制器（服务对象随控制器一起销毁）。
+    if (!m_sarService || m_serviceUuid != uuid) {
+        if (m_controller->state() == QLowEnergyController::ConnectedState)
+            m_controller->disconnectFromDevice();
+        m_controller->deleteLater();
+        m_controller = QLowEnergyController::createPeripheral(this);
+        if (!m_controller) {
+            m_sarService = nullptr;
+            m_serviceUuid = QBluetoothUuid();
+            m_advertising = false;
+            m_connected = false;
+            emit errorOccurred(QStringLiteral("无法重新创建 BLE 外设控制器"));
+            return;
+        }
+        setupControllerConnections();
+        m_sarService = nullptr;
+        m_serviceUuid = uuid;
+        m_advertising = false;
+        m_connected = false;
+        setupGattService(uuid);
+        if (!m_sarService) {
+            emit errorOccurred(QStringLiteral("创建 GATT 服务失败"));
+            return;
+        }
     }
-    setupGattService(uuid);
 
     // ---- 2. 广播名称（真实广播名称 / Complete Local Name）----
     // 广播名称是可修改的：UI 传入的 localName 会作为实际广播出去的设备名称，

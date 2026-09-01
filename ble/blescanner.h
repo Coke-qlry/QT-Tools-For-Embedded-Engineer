@@ -8,6 +8,7 @@
 
 #include <QObject>
 #include <QList>
+#include <QSet>
 #include <QBluetoothDeviceDiscoveryAgent>
 #include <QBluetoothDeviceInfo>
 
@@ -51,6 +52,7 @@ private:
     void setScanning(bool scanning);
 
     QBluetoothDeviceDiscoveryAgent *m_agent = nullptr;
-    QList<QBluetoothDeviceInfo> m_infos; // 保留完整设备信息，用于后续连接
+    QList<QBluetoothDeviceInfo> m_infos;  // 保留完整设备信息，用于后续连接
+    QSet<QString> m_addresses;            // 已发现地址集合（O(1) 去重）
     bool m_scanning = false;
 };

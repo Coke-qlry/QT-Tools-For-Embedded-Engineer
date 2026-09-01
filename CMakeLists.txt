@@ -39,6 +39,7 @@ set_target_properties(appBLE_SAR PROPERTIES
     WIN32_EXECUTABLE TRUE
     # Android: 自定义 AndroidManifest.xml，声明 BLE 相关权限
     ANDROID_MANIFEST_FILE ${CMAKE_CURRENT_SOURCE_DIR}/android/AndroidManifest.xml
+    QT_ANDROID_PACKAGE_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/android"
 )
 
 target_link_libraries(appBLE_SAR
@@ -52,3 +53,9 @@ install(TARGETS appBLE_SAR
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
+
+set_target_properties(appBLE_SAR PROPERTIES
+    # 关键：设置应用显示名称
+    QT_ANDROID_APP_NAME "BLE-SAR"
+)
+

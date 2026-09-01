@@ -105,6 +105,7 @@ void BleScanner::stopScan()
 void BleScanner::clear()
 {
     m_infos.clear();
+    m_addresses.clear();
 }
 
 void BleScanner::onDeviceDiscovered(const QBluetoothDeviceInfo &info)
@@ -113,11 +114,10 @@ void BleScanner::onDeviceDiscovered(const QBluetoothDeviceInfo &info)
     if (address.isEmpty())
         return;
 
-    // 去重：同一设备地址只保留首次记录
-    for (const QBluetoothDeviceInfo &existing : m_infos) {
-        if (deviceAddressString(existing) == address)
-            return;
-    }
+    // 去重（哈希表 O(1)）：同一设备地址只保留首次记录
+    if (m_addresses.contains(address))
+        return;
+    m_addresses.insert(address);
 
     m_infos.append(info);
     emit deviceFound(displayName(info), address, info.rssi(), isLeDevice(info));

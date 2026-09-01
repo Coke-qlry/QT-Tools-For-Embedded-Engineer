@@ -33,6 +33,7 @@
 
 #ifdef BLE_ADVERTISING_SUPPORTED
 // m_sarChar 作为值成员存储，需要完整类型（不能仅前向声明）
+#include <QBluetoothUuid>
 #include <QLowEnergyCharacteristic>
 QT_BEGIN_NAMESPACE
 class QLowEnergyController;
@@ -69,9 +70,11 @@ signals:
 private:
 #ifdef BLE_ADVERTISING_SUPPORTED
     void setupGattService(const QBluetoothUuid &serviceUuid);
+    void setupControllerConnections();
     QLowEnergyController *m_controller = nullptr;
     QLowEnergyService *m_sarService = nullptr;
     QLowEnergyCharacteristic m_sarChar;      // 可读/可写/可通知特征
+    QBluetoothUuid m_serviceUuid;            // 当前已注册的 GATT 服务 UUID
 #endif
     bool m_advertising = false;
     bool m_connected = false;

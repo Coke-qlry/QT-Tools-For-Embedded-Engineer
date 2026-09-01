@@ -61,6 +61,12 @@ void BleConnection::connectToDevice(const QBluetoothDeviceInfo &info)
         m_controller->deleteLater();
         m_controller = nullptr;
     }
+    // 注意：服务对象（父对象为 this，由 createServiceObject 创建）并不会随
+    // controller 销毁而释放，但删除它们必须等旧 controller 真正销毁之后——
+    // 旧 controller 内部仍持有服务指针，若在 deleteLater 期间提前删除，
+    // 其析构时会访问悬空指针导致 use-after-free 崩溃。
+    // 因此这里仅清空索引：服务对象统一由下一次服务发现完成时
+    // （onServiceDiscoveryFinished 中的 qDeleteAll）或 BleConnection 析构回收。
     m_services.clear();
     m_serviceObjects.clear();
 
@@ -91,6 +97,9 @@ void BleConnection::connectToDevice(const QBluetoothDeviceInfo &info)
 
 void BleConnection::onConnected()
 {
+    // 忽略旧控制器（已 deleteLater 但尚未销毁）发出的迟到信号
+    if (sender() != m_controller)
+        return;
     m_connected = true;
     emit connectedChanged(true);
     emit stateChanged(QStringLiteral("已连接"));
@@ -99,6 +108,8 @@ void BleConnection::onConnected()
 
 void BleConnection::onDisconnected()
 {
+    if (sender() != m_controller)
+        return;
     m_connected = false;
     emit connectedChanged(false);
     emit stateChanged(QStringLiteral("已断开"));
@@ -106,6 +117,9 @@ void BleConnection::onDisconnected()
 
 void BleConnection::disconnectFromDevice()
 {
+    // 仅发起断连：disconnected 为异步信号，须等待其驱动状态更新；
+    // 控制器与服务对象的回收统一交给下一次 connectToDevice() 或析构完成，
+    // 避免在断连完成前销毁控制器导致状态无法回落到“已断开”。
     if (m_controller)
         m_controller->disconnectFromDevice();
 }
@@ -122,7 +136,7 @@ void BleConnection::discoverServices()
 
 void BleConnection::onServiceDiscoveryFinished()
 {
-    if (!m_controller)
+    if (!m_controller || sender() != m_controller)
         return;
 
     // 重建服务对象（每次发现覆盖旧的）

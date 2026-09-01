@@ -8,6 +8,10 @@
 
 int main(int argc, char *argv[])
 {
+    // 使用 Fusion（非原生）样式：支持自定义 Button 的 background/contentItem，
+    // 否则在 Windows 原生样式下自定义深色按钮会被忽略并输出大量警告。
+    qputenv("QT_QUICK_CONTROLS_STYLE", "Fusion");
+
     QGuiApplication app(argc, argv);
 
     // BLE 功能后端：扫描 / 广播 / GATT 连接（模块化，见 ble/ 目录）

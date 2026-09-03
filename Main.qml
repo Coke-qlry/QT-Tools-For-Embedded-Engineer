@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import QtQuick.Dialogs
 import BLE_SAR.Ble
 
 // =====================================================================
@@ -8,11 +9,15 @@ import BLE_SAR.Ble
 // 界面通过全局对象 bleManager 调用 C++ 后端，实现扫描 / 广播 / 连接。
 // 权限通过 bleManager.permissions（BlePermissions）在 Android 上动态申请。
 //
-// 页面架构：扫描 / 广播 / 指令 / 关于 四个功能相互独立，
-// 各自拥有独立顶栏与专属操作，底部导航负责切换。
-//   - 扫描页：右上角「过滤 / 排序 / 清除」+ 右下角悬浮扫描按钮，
-//             支持按 RSSI 阈值、MAC 地址、蓝牙名称过滤设备。
-//   - 广播页 / 指令页 / 关于页：独立页面，顶栏带返回按钮。
+// 页面架构：本文件仅保留「外壳」——主题色、跨页共享状态、设备模型、
+// 共享逻辑函数、底部导航与蓝牙信号对接；各功能页面按界面分类拆分为
+// 独立 QML 组件（模块 BLE_SAR 内自动注册类型），通过 app 句柄访问共享部分：
+//   - ScanPage.qml      扫描页（含过滤对话框与过滤逻辑）
+//   - AdvertisePage.qml 广播页（含广播参数输入）
+//   - TerminalPage.qml  调试页（含服务/特征目录、导出/定时对话框）
+//   - CommandPage.qml   指令页（含指令数据模型与增删改查）
+//   - AboutPage.qml     关于页
+// 后续改动页面时只需修改对应文件；改动共享逻辑时修改本文件。
 // =====================================================================
 
 Window {
@@ -22,7 +27,7 @@ Window {
     minimumWidth: 380
     minimumHeight: 640
     visible: true
-    title: qsTr("BLE SAR - 仿 nRF Connect")
+    title: qsTr("BLE SAR")
 
     // ---------------- 主题色 ----------------
     readonly property color cBg:        "#0F1116"   // 窗口背景
@@ -38,16 +43,19 @@ Window {
     readonly property color cOrange:    "#F39C12"
 
     // ---------------- 状态 ----------------
-    property int currentTab: 0          // 0=扫描 1=广播 2=指令 3=关于
+    property int currentTab: 0          // 0=扫描 1=广播 2=调试 3=指令 4=关于
     property bool scanning: false       // 由 bleManager.scanningChanged 驱动
     property bool advertising: false    // 由 bleManager.advertisingChanged 驱动
     property bool peripheralConnected: false // 外设被其它设备连接状态
-    property int lastFound: -1          // 指令查找的起始游标
     property bool sortByName: false     // true=按名称排序，false=按RSSI排序
     property string targetAddress: ""   // 当前连接目标设备地址
+    property string connectingAddress: "" // 正在连接中(尚未成功)的设备地址，空=当前无进行中的连接
     property var pendingAction: null    // 权限授权成功后待执行的动作
+    // 连接失败后短暂抑制后续补充信号的时刻戳(毫秒)：Android 上连接失败可能
+    // errorOccurred 与 disconnected 先后到达，避免弹两次提示
+    property var suppressErrUntil: 0
 
-    // ---- 扫描过滤条件 ----
+    // ---- 扫描过滤条件（ScanPage 读写，本文件提供状态与重建逻辑）----
     property int filterMinRssi: -127    // 最小 RSSI 阈值（-127 = 不过滤）
     property string filterAddress: ""   // MAC 地址包含关键字
     property string filterName: ""      // 蓝牙名称包含关键字
@@ -68,6 +76,9 @@ Window {
     // 打开程序进入界面后，蓝牙扫描权限就绪即自动扫描一次：
     // 已有权限 → 直接扫描；未授权 → 自动弹窗申请，授权成功后立即开始扫描
     Component.onCompleted: {
+        // 自定义指令库：启动即准备 ble_command_config（首次运行时自动建库
+        // 并写入出厂默认指令；之后每次启动加载用户上一次保存的配置）
+        commandPage.initFromSqlite()
         autoScanTimer.start()
         // 页面就绪后刷新一次系统蓝牙名称：已有权限时立即显示真实名称，
         // 未授权时保持占位名，权限授予后由 onPermissionGranted 再次刷新。
@@ -79,9 +90,17 @@ Window {
         interval: 300
         onTriggered: root.startScan()
     }
+    // 连接超时兜底：15 秒内既未成功也未收到失败通知时提示并复位，
+    // 防止异常情况下按钮一直停在黄色“连接中”
+    Timer {
+        id: connectTimeoutTimer
+        interval: 15000
+        onTriggered: root.failConnect(root.connectingAddress,
+            "连接超时：请确认设备已开机且靠近本机，未被其它手机占用，然后重试")
+    }
 
     // =================================================================
-    // 主界面功能接口（调用 C++ 后端 bleManager）
+    // 共享逻辑函数（各页面通过 app 句柄调用）
     // =================================================================
 
     // ---- 权限辅助 ----
@@ -124,7 +143,16 @@ Window {
         }
         if (!it) return
         if (it.connected) { bleManager.disconnectFromDevice(); return }
+        if (it.connecting) return                      // 该设备已在连接中，忽略重复点击
+        if (root.connectingAddress !== "") {           // 已有其它设备正在连接
+            root.showToast("请等待当前设备连接完成")
+            return
+        }
+        // 进入「连接中」状态：按钮变黄色，直到成功 / 失败 / 超时
         root.targetAddress = address
+        root.connectingAddress = address
+        root.setDeviceConnecting(address, true)
+        connectTimeoutTimer.restart()                  // 超时兜底，防止一直“连接中”
         ensurePermission(BlePermissions.ConnectPermission, function () {
             bleManager.connectToDevice(root.targetAddress)
         })
@@ -165,134 +193,104 @@ Window {
         viewModel.clear()
         for (var j = 0; j < arr.length; j++) viewModel.append(arr[j])
     }
-    // 应用过滤对话框中的条件
-    function applyFilter() {
-        root.filterMinRssi = filterDialog.rssiSel
-        root.filterAddress = filterMacField.text.trim()
-        root.filterName = filterNameField.text.trim()
-        root.rebuildViewModel()
-        filterDialog.close()
-        root.showToast(root.filterActive ? "已应用过滤条件" : "已清除过滤条件")
-    }
-    // 重置全部过滤条件（含对话框内输入）
-    function resetFilter() {
-        root.filterMinRssi = -127
-        root.filterAddress = ""
-        root.filterName = ""
-        filterDialog.rssiSel = -127
-        filterMacField.text = ""
-        filterNameField.text = ""
-        root.rebuildViewModel()
-        root.showToast("已重置过滤条件")
-    }
-    // 清除过滤条件（提示条上的 ✕）
-    function clearFilter() {
-        root.filterMinRssi = -127
-        root.filterAddress = ""
-        root.filterName = ""
-        root.rebuildViewModel()
-        root.showToast("已清除过滤条件")
-    }
-    // 连接状态变化时同步原始模型与显示模型
+
+    // ---- 连接状态同步（ScanPage 展示）----
+    // 连接状态变化时同步原始模型与显示模型（同时复位连接中标记）
     function updateDeviceConnected(address, v) {
         for (var i = 0; i < deviceModel.count; i++) {
             if (deviceModel.get(i).address === address)
-                deviceModel.set(i, { connected: v })
+                deviceModel.set(i, { connected: v, connecting: false })
         }
         for (var j = 0; j < viewModel.count; j++) {
             if (viewModel.get(j).address === address)
-                viewModel.set(j, { connected: v })
+                viewModel.set(j, { connected: v, connecting: false })
+        }
+    }
+    // 标记某设备是否处于「连接中」状态（同步两个模型，驱动按钮变黄色）
+    function setDeviceConnecting(address, v) {
+        for (var i = 0; i < deviceModel.count; i++) {
+            if (deviceModel.get(i).address === address)
+                deviceModel.set(i, { connecting: v })
+        }
+        for (var j = 0; j < viewModel.count; j++) {
+            if (viewModel.get(j).address === address)
+                viewModel.set(j, { connecting: v })
+        }
+    }
+    // 复位「连接中」状态（当前无进行中的连接时忽略）
+    function clearConnecting() {
+        if (root.connectingAddress === "") return
+        root.setDeviceConnecting(root.connectingAddress, false)
+        root.connectingAddress = ""
+        connectTimeoutTimer.stop()
+    }
+    // 连接失败统一收口：复位连接中状态并提示，随后短暂抑制
+    // 同一次失败触发的补充信号（errorOccurred / disconnected 先后到达）
+    function failConnect(address, reason) {
+        if (root.connectingAddress === "") return
+        var addr = (address && address !== "") ? address : root.connectingAddress
+        if (addr !== root.connectingAddress) return     // 与当前连接目标不一致，忽略
+        root.setDeviceConnecting(addr, false)
+        root.updateDeviceConnected(addr, false)
+        root.connectingAddress = ""
+        connectTimeoutTimer.stop()
+        root.suppressErrUntil = Date.now() + 2500
+        root.showToast(reason)
+    }
+
+    // ---- 连接/收发日志（打印到指令页日志文本框，供连接后观察）----
+    // Central 连接成功：绿字信息块 + 设备信息（名称/MAC/信号强度取扫描缓存）
+    function logConnected() {
+        var nm = "N/A", rssi = "?"
+        for (var i = 0; i < deviceModel.count; i++) {
+            var it = deviceModel.get(i)
+            if (it.address === root.targetAddress) {
+                if (it.name !== "" && it.name !== "N/A") nm = it.name
+                rssi = it.rssi
+                break
+            }
+        }
+        commandPage.appendLog("[BLE-SAR]:已连接到蓝牙[" + nm + "]，相关信息如下:",
+                              root.cGreen)
+        commandPage.appendLog("[" + nm + "]: MAC地址 " + root.targetAddress
+                              + " · 信号强度 " + rssi + " dBm", root.cAccent)
+    }
+    // 服务发现完成：把各服务 UUID 补充打印到设备信息区
+    function logServices(services) {
+        var list = (typeof services === "object" && services) ? services : []
+        if (list.length === 0) return
+        commandPage.appendLog("[BLE-SAR]:已发现 " + list.length
+                              + " 个服务，UUID 如下:", root.cAccent)
+        for (var i = 0; i < list.length; i++) {
+            var svc = list[i]
+            commandPage.appendLog("  • " + svc.uuid
+                                  + ((svc.name && svc.name !== "")
+                                     ? " (" + svc.name + ")" : ""), root.cSubtext)
+        }
+    }
+    // Central 断开连接日志
+    function logDisconnected() {
+        commandPage.appendLog("[BLE-SAR]:已断开与[" + root.targetAddress + "]的连接",
+                              root.cOrange)
+    }
+    // 外设（Peripheral）被对方连接 / 断开日志
+    function logPeripheral(v) {
+        if (v) {
+            commandPage.appendLog("[BLE-SAR]:已连接到蓝牙["
+                                  + bleManager.localDeviceName + "]，相关信息如下:",
+                                  root.cGreen)
+            commandPage.appendLog("[" + bleManager.localDeviceName
+                                  + "]: 外设模式 · 等待对端设备写入数据", root.cAccent)
+        } else {
+            commandPage.appendLog("[BLE-SAR]:对方设备已断开连接", root.cOrange)
         }
     }
 
-    // ---- 广播 ----
-    function startAdvertise() {
-        ensurePermission(BlePermissions.AdvertisePermission, function () {
-            // 广播名称 = 本机系统蓝牙名称：Android 平台广播包名称只能由系统
-            // 填充（即系统蓝牙名，应用内无法自定义），其它平台则以该名称广播；
-            // 名称为空时由 C++ 端回退默认名。超长截断由 C++ 端完成并回调提示。
-            bleManager.startAdvertise(bleManager.localDeviceName,
-                                      advertUuidField.text.trim(),
-                                      parseInt(advertIntervalField.text, 10) || 100)
-        })
-    }
-    function stopAdvertise() {
-        bleManager.stopAdvertise()
-    }
-
-    // ---- 轻提示 ----
+    // ---- 轻提示（全局 Toast）----
     function showToast(msg) {
         toastText.text = msg
         toast.visible = true
         toastTimer.restart()
-    }
-
-    // ---- 指令页：增删改查 ----
-    // 新增：弹出空表单
-    function openAddDialog() {
-        editDialog.isNew = true
-        editDialog.titleText = "新增指令 (Add)"
-        editNameField.text = ""
-        editCmdField.text = ""
-        editDialog.open()
-    }
-    // 修改：选中后单击右上角修改图标
-    function openEditDialog() {
-        var idx = commandList.currentIndex
-        if (idx < 0) { showToast("请先选中一条指令"); return }
-        var it = instructionModel.get(idx)
-        editDialog.isNew = false
-        editDialog.titleText = "修改指令 (Edit)"
-        editNameField.text = it.name
-        editCmdField.text = it.command
-        editDialog.open()
-    }
-    // 保存（新增/修改共用）
-    function saveEdit() {
-        var n = editNameField.text.trim()
-        var c = editCmdField.text.trim()
-        if (n === "" && c === "") { showToast("名称与内容不能同时为空"); return }
-        var isNew = editDialog.isNew
-        if (isNew) {
-            instructionModel.append({ name: n, command: c, note: "" })
-        } else {
-            instructionModel.set(commandList.currentIndex, { name: n, command: c, note: "" })
-        }
-        editDialog.close()
-        showToast(isNew ? "已新增指令" : "已保存修改")
-    }
-    // 删除按钮：短按删选中
-    function deleteSelectedCommand() {
-        var idx = commandList.currentIndex
-        if (idx < 0) { showToast("请先选中一条指令"); return }
-        instructionModel.remove(idx)
-        commandList.currentIndex = Math.min(idx, instructionModel.count - 1)
-        showToast("已删除选中指令")
-    }
-    // 删除按钮：长按 2 秒删全部
-    function deleteAllCommands() {
-        instructionModel.clear()
-        commandList.currentIndex = -1
-        showToast("已删除全部指令")
-    }
-    // 查找：输入关键字后跳转定位
-    function locateCommands(keyword) {
-        keyword = keyword.trim()
-        if (keyword === "") return
-        var total = instructionModel.count
-        var start = (lastFound + 1) % Math.max(total, 1)
-        for (var i = 0; i < total; i++) {
-            var idx = (start + i) % total
-            var it = instructionModel.get(idx)
-            if (it.name.indexOf(keyword) >= 0 || it.command.indexOf(keyword) >= 0 || it.note.indexOf(keyword) >= 0) {
-                lastFound = idx
-                commandList.currentIndex = idx
-                commandList.positionViewAtIndex(idx, ListView.Center)
-                showToast("已定位: " + it.name)
-                return
-            }
-        }
-        showToast("未找到包含「" + keyword + "」的指令")
     }
 
     // RSSI 转 0~4 格信号
@@ -303,30 +301,32 @@ Window {
         if (rssi >= -85) return 1
         return 0
     }
+    // 信号图标点亮格数：极弱(< -85)也至少点亮 1 格(红色)，
+    // 让用户直观看到“有信号但很弱”，而不是整组变灰
+    function rssiBars(rssi) {
+        var lv = rssiLevel(rssi)
+        return lv > 0 ? lv : 1
+    }
+    // 信号强度等级颜色：强(>= -65)=绿，中(-85~-65)=黄，弱(<-85)=红
+    function rssiColor(rssi) {
+        if (rssi >= -65) return root.cGreen
+        if (rssi >= -85) return root.cOrange
+        return root.cRed
+    }
 
     // =================================================================
     // 设备列表模型（由 C++ 后端扫描结果填充）
     //   deviceModel: 原始数据（扫描填充，不随排序/过滤改变）
-    //   viewModel  : 显示数据（过滤 + 排序后的子集）
-    // 字段: name / address / rssi / connected / isConnectable
+    //   viewModel  : 显示数据（过滤 + 排序后的子集，ScanPage 展示）
+    // 字段: name / address / rssi / connected / connecting / isConnectable
+    //   connecting 表示“正在连接(尚未成功)”，驱动按钮变黄色“连接中”
     // =================================================================
-    ListModel { id: deviceModel }
-    ListModel { id: viewModel }
-
-    // =================================================================
-    // 自定义指令模型（字段: name/command/note）
-    // =================================================================
-    ListModel {
-        id: instructionModel
-        Component.onCompleted: {
-            instructionModel.append({ name: "读取电量",  command: "AT+VBAT?",    note: "返回当前电池电压" })
-            instructionModel.append({ name: "读取SAR值", command: "AT+SAR?",     note: "查询SAR检测结果" })
-            instructionModel.append({ name: "启动扫描",  command: "AT+SCAN=1",   note: "" })
-            instructionModel.append({ name: "停止扫描",  command: "AT+SCAN=0",   note: "" })
-            instructionModel.append({ name: "设置阈值",  command: "AT+THRESH=100", note: "设置SAR阈值(μW/g)" })
-            instructionModel.append({ name: "重启设备",  command: "AT+RST",      note: "软重启" })
-        }
-    }
+    ListModel { id: modelDevice }
+    ListModel { id: modelView }
+    // 模型别名：供子页面经 app.deviceModel / app.viewModel 访问，
+    // 页面内仍可逐字沿用拆分前的 id 引用写法，行为保持一致
+    property alias deviceModel: modelDevice
+    property alias viewModel: modelView
 
     // ---------------- 全局背景 ----------------
     Rectangle {
@@ -335,922 +335,58 @@ Window {
     }
 
     // =================================================================
-    // 主界面：四个相互独立的页面（扫描 / 广播 / 指令 / 关于）
-    // 每页拥有独立顶栏，扫描页额外带悬浮扫描按钮
+    // 主界面：五个独立页面组件 + 底部导航
+    // 各页面组件内部自带独立顶栏/对话框/专属逻辑，经 app 句柄
+    // 访问本文件的主题色、模型、共享函数与 Toast。
     // =================================================================
     Item {
         id: mainView
         anchors.fill: parent
 
-        // ==================== 扫描页 ====================
-        Item {
+        ScanPage {
             id: scanPage
+            app: root
             visible: root.currentTab === 0
             anchors.top: parent.top
             anchors.left: parent.left
             anchors.right: parent.right
             anchors.bottom: bottomNav.top
-
-            // -------- 扫描页顶栏 --------
-            Rectangle {
-                id: scanHeader
-                width: parent.width
-                height: 56
-                color: root.cSurface
-                z: 10
-                Rectangle {
-                    width: parent.width
-                    height: 1
-                    color: root.cDivider
-                    anchors.bottom: parent.bottom
-                }
-                Text {
-                    anchors.left: parent.left
-                    anchors.leftMargin: 16
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: "扫描 (Scan)"
-                    color: root.cText
-                    font.pixelSize: 16
-                    font.bold: true
-                }
-                // 过滤（仅扫描页显示）
-                ToolButton {
-                    anchors.right: parent.right
-                    anchors.rightMargin: 124
-                    anchors.bottom: parent.bottom
-                    anchors.bottomMargin: 1
-                    implicitWidth: 58
-                    implicitHeight: 52
-                    onClicked: filterDialog.open()
-                    contentItem: Column {
-                        spacing: 2
-                        anchors.centerIn: parent
-                        Text {
-                            text: "⏳"
-                            font.pixelSize: 15
-                            height: 20
-                            verticalAlignment: Text.AlignVCenter
-                            color: root.filterActive ? root.cAccent : root.cText
-                            horizontalAlignment: Text.AlignHCenter
-                            anchors.horizontalCenter: parent.horizontalCenter
-                        }
-                        Text {
-                            text: "过滤(Filter)"
-                            font.pixelSize: 9
-                            color: root.filterActive ? root.cAccent : root.cText
-                            horizontalAlignment: Text.AlignHCenter
-                            anchors.horizontalCenter: parent.horizontalCenter
-                        }
-                    }
-                }
-                // 排序（仅扫描页显示）
-                ToolButton {
-                    anchors.right: parent.right
-                    anchors.rightMargin: 66
-                    anchors.bottom: parent.bottom
-                    anchors.bottomMargin: 1
-                    implicitWidth: 58
-                    implicitHeight: 52
-                    onClicked: root.sortDevices()
-                    contentItem: Column {
-                        spacing: 2
-                        anchors.centerIn: parent
-                        Text {
-                            text: "⇅"
-                            font.pixelSize: 15
-                            height: 20
-                            verticalAlignment: Text.AlignVCenter
-                            color: root.cText
-                            horizontalAlignment: Text.AlignHCenter
-                            anchors.horizontalCenter: parent.horizontalCenter
-                        }
-                        Text {
-                            text: "排序(Sort)"
-                            font.pixelSize: 9
-                            color: root.cText
-                            horizontalAlignment: Text.AlignHCenter
-                            anchors.horizontalCenter: parent.horizontalCenter
-                        }
-                    }
-                }
-                // 清除（仅扫描页显示）
-                ToolButton {
-                    anchors.right: parent.right
-                    anchors.rightMargin: 8
-                    anchors.bottom: parent.bottom
-                    anchors.bottomMargin: 1
-                    implicitWidth: 58
-                    implicitHeight: 52
-                    onClicked: root.clearDevices()
-                    contentItem: Column {
-                        spacing: 2
-                        anchors.centerIn: parent
-                        Text {
-                            text: "✕"
-                            font.pixelSize: 15
-                            height: 20
-                            verticalAlignment: Text.AlignVCenter
-                            color: root.cText
-                            horizontalAlignment: Text.AlignHCenter
-                            anchors.horizontalCenter: parent.horizontalCenter
-                        }
-                        Text {
-                            text: "清除(Clear)"
-                            font.pixelSize: 9
-                            color: root.cText
-                            horizontalAlignment: Text.AlignHCenter
-                            anchors.horizontalCenter: parent.horizontalCenter
-                        }
-                    }
-                }
-            }
-
-            // -------- 过滤激活提示条 --------
-            Rectangle {
-                id: filterBanner
-                visible: root.filterActive
-                width: parent.width
-                height: 36
-                color: root.cAccentDark
-                anchors.top: scanHeader.bottom
-                z: 5
-                Row {
-                    anchors.left: parent.left
-                    anchors.leftMargin: 16
-                    anchors.verticalCenter: parent.verticalCenter
-                    spacing: 6
-                    Text {
-                        text: "过滤:"
-                        color: "#BFE8FB"
-                        font.pixelSize: 12
-                        anchors.verticalCenter: parent.verticalCenter
-                    }
-                    Text {
-                        text: root.filterSummaryText
-                        color: "white"
-                        font.pixelSize: 12
-                        font.bold: true
-                        anchors.verticalCenter: parent.verticalCenter
-                    }
-                }
-                Text {
-                    anchors.right: parent.right
-                    anchors.rightMargin: 12
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: "✕ 清除"
-                    color: "#BFE8FB"
-                    font.pixelSize: 12
-                    MouseArea {
-                        anchors.fill: parent
-                        onClicked: root.clearFilter()
-                    }
-                }
-            }
-
-            // -------- 状态条 --------
-            Rectangle {
-                id: statusBanner
-                width: parent.width
-                height: 44
-                color: root.scanning ? root.cAccentDark : root.cSurface
-                visible: root.scanning || deviceModel.count === 0
-                anchors.top: filterBanner.visible ? filterBanner.bottom : scanHeader.bottom
-                Row {
-                    anchors.centerIn: parent
-                    spacing: 10
-                    BusyIndicator {
-                        width: 18
-                        height: 18
-                        running: root.scanning
-                        visible: root.scanning
-                        anchors.verticalCenter: parent.verticalCenter
-                    }
-                    Text {
-                        anchors.verticalCenter: parent.verticalCenter
-                        text: root.scanning ? qsTr("正在扫描… (Scanning)") : qsTr("点击右下角按钮开始扫描 (Scan)")
-                        color: root.cText
-                        font.pixelSize: 13
-                    }
-                }
-            }
-
-            // -------- 设备列表（显示模型：过滤 + 排序） --------
-            ListView {
-                id: deviceList
-                anchors.top: statusBanner.visible ? statusBanner.bottom
-                                                  : (filterBanner.visible ? filterBanner.bottom : scanHeader.bottom)
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.bottom: parent.bottom
-                clip: true
-                model: viewModel
-                spacing: 1
-                ScrollBar.vertical: ScrollBar {}
-
-                delegate: Rectangle {
-                    width: deviceList.width
-                    height: 72
-                    color: mouseArea.pressed ? root.cSurface2 : root.cSurface
-
-                    Rectangle {
-                        width: 10
-                        height: 10
-                        radius: 5
-                        color: model.connected ? root.cGreen : root.cSubtext
-                        anchors.left: parent.left
-                        anchors.leftMargin: 16
-                        anchors.verticalCenter: parent.verticalCenter
-                    }
-
-                    Column {
-                        anchors.left: parent.left
-                        anchors.leftMargin: 36
-                        anchors.right: rightCol.left
-                        anchors.rightMargin: 8
-                        anchors.verticalCenter: parent.verticalCenter
-                        spacing: 4
-                        Text {
-                            width: parent.width
-                            elide: Text.ElideRight
-                            text: model.name
-                            color: root.cText
-                            font.pixelSize: 15
-                            font.bold: true
-                        }
-                        Text {
-                            width: parent.width
-                            elide: Text.ElideRight
-                            text: model.address
-                            color: root.cSubtext
-                            font.pixelSize: 12
-                        }
-                    }
-
-                    Row {
-                        id: rightCol
-                        anchors.right: parent.right
-                        anchors.rightMargin: 12
-                        anchors.verticalCenter: parent.verticalCenter
-                        spacing: 10
-
-                        // RSSI
-                        Row {
-                            spacing: 6
-                            Rectangle {
-                                width: 24
-                                height: 30
-                                anchors.verticalCenter: parent.verticalCenter
-                                color: "transparent"
-                                Repeater {
-                                    model: 4
-                                    Rectangle {
-                                        width: 3
-                                        height: 6 + (index + 1) * 6
-                                        radius: 1
-                                        anchors.bottom: parent.bottom
-                                        x: index * 6
-                                        color: (index < rssiLevel(model.rssi))
-                                               ? (model.rssi >= -65 ? root.cGreen : root.cOrange)
-                                               : root.cDivider
-                                    }
-                                }
-                            }
-                            Text {
-                                text: model.rssi
-                                color: model.rssi >= -65 ? root.cGreen :
-                                       model.rssi >= -85 ? root.cOrange : root.cRed
-                                font.pixelSize: 12
-                                anchors.verticalCenter: parent.verticalCenter
-                            }
-                        }
-
-                        // 连接按钮
-                        Rectangle {
-                            width: 66
-                            height: 30
-                            radius: 15
-                            color: model.connected ? root.cDivider : root.cAccent
-                            anchors.verticalCenter: parent.verticalCenter
-                            Text {
-                                anchors.centerIn: parent
-                                text: model.connected ? "已连接" : "连接(Conn)"
-                                color: "white"
-                                font.pixelSize: 11
-                            }
-                            MouseArea {
-                                anchors.fill: parent
-                                onClicked: root.connectToDeviceByAddress(model.address)
-                            }
-                        }
-                    }
-
-                    // 整行点击也可连接
-                    MouseArea {
-                        id: mouseArea
-                        anchors.fill: parent
-                        onClicked: root.connectToDeviceByAddress(model.address)
-                    }
-
-                    Rectangle {
-                        width: parent.width
-                        height: 1
-                        color: root.cDivider
-                        anchors.bottom: parent.bottom
-                    }
-                }
-            }
-
-            // -------- 悬浮扫描按钮 (FAB) —— 仅扫描页显示 --------
-            Rectangle {
-                width: 60
-                height: 60
-                radius: 30
-                color: root.scanning ? root.cRed : root.cAccent
-                anchors.right: parent.right
-                anchors.rightMargin: 20
-                anchors.bottom: parent.bottom
-                anchors.bottomMargin: 16
-                z: 20
-                Column {
-                    anchors.centerIn: parent
-                    spacing: 1
-                    Text {
-                        anchors.horizontalCenter: parent.horizontalCenter
-                        text: root.scanning ? "■" : "▶"
-                        color: "white"
-                        font.pixelSize: 16
-                    }
-                    Text {
-                        anchors.horizontalCenter: parent.horizontalCenter
-                        text: root.scanning ? "停止(Stop)" : "扫描(Scan)"
-                        color: "white"
-                        font.pixelSize: 10
-                    }
-                }
-                MouseArea {
-                    anchors.fill: parent
-                    onClicked: {
-                        if (root.scanning) root.stopScan()
-                        else root.startScan()
-                    }
-                }
-            }
         }
-
-        // ==================== 广播页 ====================
-        Item {
+        AdvertisePage {
             id: advertPage
+            app: root
             visible: root.currentTab === 1
             anchors.top: parent.top
             anchors.left: parent.left
             anchors.right: parent.right
             anchors.bottom: bottomNav.top
-
-            // -------- 广播页顶栏 --------
-            Rectangle {
-                id: advertHeader
-                width: parent.width
-                height: 56
-                color: root.cSurface
-                z: 10
-                Rectangle {
-                    width: parent.width
-                    height: 1
-                    color: root.cDivider
-                    anchors.bottom: parent.bottom
-                }
-                // 返回
-                ToolButton {
-                    anchors.left: parent.left
-                    anchors.leftMargin: 4
-                    anchors.verticalCenter: parent.verticalCenter
-                    implicitWidth: 44
-                    implicitHeight: 44
-                    onClicked: root.currentTab = 0
-                    contentItem: Text {
-                        text: "‹"
-                        font.pixelSize: 30
-                        color: root.cText
-                        horizontalAlignment: Text.AlignHCenter
-                        verticalAlignment: Text.AlignVCenter
-                    }
-                }
-                Text {
-                    anchors.left: parent.left
-                    anchors.leftMargin: 52
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: "广播 (Advertiser)"
-                    color: root.cText
-                    font.pixelSize: 16
-                    font.bold: true
-                }
-            }
-
-            // -------- 广播内容 --------
-            Column {
-                anchors.top: advertHeader.bottom
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.bottom: parent.bottom
-                anchors.margins: 16
-                spacing: 12
-                Text {
-                    text: qsTr("广播 (Advertiser)")
-                    color: root.cText
-                    font.pixelSize: 20
-                    font.bold: true
-                }
-                // 广播状态指示 + 外设连接状态
-                Column {
-                    width: parent.width
-                    spacing: 6
-                    Row {
-                        spacing: 8
-                        Rectangle {
-                            width: 10
-                            height: 10
-                            radius: 5
-                            color: root.advertising ? root.cGreen : root.cSubtext
-                            anchors.verticalCenter: parent.verticalCenter
-                        }
-                        Text {
-                            text: root.advertising ? "正在广播 (Advertising)" : "未广播 (Idle)"
-                            color: root.advertising ? root.cGreen : root.cSubtext
-                            font.pixelSize: 13
-                            anchors.verticalCenter: parent.verticalCenter
-                        }
-                    }
-                    Row {
-                        spacing: 8
-                        visible: root.advertising   // 仅在广播中显示连接状态
-                        Rectangle {
-                            width: 10
-                            height: 10
-                            radius: 5
-                            color: root.peripheralConnected ? root.cGreen : root.cSubtext
-                            anchors.verticalCenter: parent.verticalCenter
-                        }
-                        Text {
-                            text: root.peripheralConnected
-                                  ? "已连接：可收发数据" : "等待其它设备连接…"
-                            color: root.peripheralConnected ? root.cGreen : root.cSubtext
-                            font.pixelSize: 13
-                            anchors.verticalCenter: parent.verticalCenter
-                        }
-                    }
-                }
-                Rectangle {
-                    width: parent.width
-                    height: 44
-                    radius: 22
-                    color: root.advertising ? root.cRed : root.cAccent
-                    anchors.horizontalCenter: parent.horizontalCenter
-                    Text {
-                        anchors.centerIn: parent
-                        text: root.advertising ? qsTr("停止广播 (Stop)") : qsTr("开始广播 (Start)")
-                        color: "white"
-                        font.pixelSize: 15
-                        font.bold: true
-                    }
-                    MouseArea {
-                        anchors.fill: parent
-                        onClicked: root.advertising ? root.stopAdvertise() : root.startAdvertise()
-                    }
-                }
-                GridLayout {
-                    width: parent.width
-                    columns: 2
-                    rowSpacing: 10
-                    columnSpacing: 12
-
-                    Text { text: "广播名称"; color: root.cSubtext; font.pixelSize: 14 }
-                    TextField {
-                        id: advertNameField
-                        Layout.fillWidth: true
-                        height: 36
-                        // 只读显示本机系统蓝牙名称：Android 广播包中的名称由系统
-                        // 填充（即系统蓝牙名），应用内无法自定义，展示给用户直观对应
-                        readOnly: true
-                        text: bleManager.localDeviceName.length > 0
-                              ? bleManager.localDeviceName : "BLE_SAR"
-                        placeholderText: "BLE_SAR"
-                        placeholderTextColor: root.cSubtext
-                        color: root.cSubtext
-                        font.pixelSize: 13
-                        background: Rectangle { color: root.cSurface2; radius: 4; border.color: root.cDivider }
-                    }
-
-                    Text { text: "Service UUID"; color: root.cSubtext; font.pixelSize: 14 }
-                    TextField {
-                        id: advertUuidField
-                        Layout.fillWidth: true
-                        height: 36
-                        placeholderText: "0000feb1-0000-1000-8000-00805f9b34fb"
-                        placeholderTextColor: root.cSubtext
-                        color: root.cAccent
-                        font.pixelSize: 12
-                        background: Rectangle { color: root.cSurface2; radius: 4; border.color: root.cDivider }
-                    }
-
-                    Text { text: "广播间隔(ms)"; color: root.cSubtext; font.pixelSize: 14 }
-                    TextField {
-                        id: advertIntervalField
-                        Layout.fillWidth: true
-                        height: 36
-                        text: "100"
-                        placeholderText: "100"
-                        inputMethodHints: Qt.ImhDigitsOnly
-                        placeholderTextColor: root.cSubtext
-                        color: root.cText
-                        font.pixelSize: 13
-                        background: Rectangle { color: root.cSurface2; radius: 4; border.color: root.cDivider }
-                    }
-                }
-                Text {
-                    width: parent.width
-                    wrapMode: Text.Wrap
-                    text: qsTr("说明：点击「开始广播」后本机作为真实可连接的 BLE 外设广播（内置 GATT 服务），其它设备可扫描到并连接，连接后可收发数据。广播名称显示的是本机系统蓝牙名称（Android 平台广播名称即系统蓝牙名，应用内不可修改），如需修改请到手机「设置 → 蓝牙 → 设备名称」中更改。Service UUID 可留空。")
-                    color: root.cSubtext
-                    font.pixelSize: 12
-                }
-            }
         }
-
-        // ==================== 指令页 ====================
-        Item {
-            id: commandPage
+        TerminalPage {
+            id: terminalPage
+            app: root
             visible: root.currentTab === 2
             anchors.top: parent.top
             anchors.left: parent.left
             anchors.right: parent.right
             anchors.bottom: bottomNav.top
-
-            // -------- 指令页顶栏 --------
-            Rectangle {
-                id: cmdHeader
-                width: parent.width
-                height: 56
-                color: root.cSurface
-                z: 10
-                Rectangle {
-                    width: parent.width
-                    height: 1
-                    color: root.cDivider
-                    anchors.bottom: parent.bottom
-                }
-
-                // 返回
-                ToolButton {
-                    anchors.left: parent.left
-                    anchors.leftMargin: 4
-                    anchors.verticalCenter: parent.verticalCenter
-                    implicitWidth: 44
-                    implicitHeight: 44
-                    onClicked: root.currentTab = 0
-                    contentItem: Text {
-                        text: "‹"
-                        font.pixelSize: 30
-                        color: root.cText
-                        horizontalAlignment: Text.AlignHCenter
-                        verticalAlignment: Text.AlignVCenter
-                    }
-                }
-
-                Text {
-                    anchors.left: parent.left
-                    anchors.leftMargin: 52
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: "自定义指令"
-                    color: root.cText
-                    font.pixelSize: 16
-                    font.bold: true
-                }
-
-                // -------- 右上角：增 删 改 查 --------
-                ToolButton {
-                    id: addBtn
-                    anchors.right: parent.right
-                    anchors.rightMargin: 8
-                    anchors.verticalCenter: parent.verticalCenter
-                    implicitWidth: 60
-                    implicitHeight: 52
-                    onClicked: root.openAddDialog()
-                    contentItem: Column {
-                        spacing: 2
-                        anchors.centerIn: parent
-                        Text {
-                            text: "＋"
-                            width: 60
-                            height: 18
-                            font.pixelSize: 15
-                            color: root.cAccent
-                            horizontalAlignment: Text.AlignHCenter
-                            verticalAlignment: Text.AlignVCenter
-                        }
-                        Text {
-                            text: "增(Add)"
-                            width: 60
-                            height: 12
-                            font.pixelSize: 9
-                            color: root.cText
-                            horizontalAlignment: Text.AlignHCenter
-                            verticalAlignment: Text.AlignVCenter
-                        }
-                    }
-                }
-                ToolButton {
-                    id: editBtn
-                    anchors.right: parent.right
-                    anchors.rightMargin: 68
-                    anchors.verticalCenter: parent.verticalCenter
-                    implicitWidth: 60
-                    implicitHeight: 52
-                    onClicked: root.openEditDialog()
-                    contentItem: Column {
-                        spacing: 2
-                        anchors.centerIn: parent
-                        Text {
-                            text: "✎"
-                            width: 60
-                            height: 18
-                            font.pixelSize: 15
-                            color: root.cAccent
-                            horizontalAlignment: Text.AlignHCenter
-                            verticalAlignment: Text.AlignVCenter
-                        }
-                        Text {
-                            text: "改(Edit)"
-                            width: 60
-                            height: 12
-                            font.pixelSize: 9
-                            color: root.cText
-                            horizontalAlignment: Text.AlignHCenter
-                            verticalAlignment: Text.AlignVCenter
-                        }
-                    }
-                }
-                ToolButton {
-                    id: delBtn
-                    anchors.right: parent.right
-                    anchors.rightMargin: 128
-                    anchors.verticalCenter: parent.verticalCenter
-                    implicitWidth: 60
-                    implicitHeight: 52
-
-                    // 长按 2 秒 = 全部删除；短按 = 删除选中
-                    onPressed: {
-                        delHoldTimer.restart()
-                        delBtn.colorOverlay = true
-                    }
-                    onReleased: {
-                        if (delHoldTimer.running) { delHoldTimer.stop(); root.deleteSelectedCommand() }
-                        delBtn.colorOverlay = false
-                    }
-                    onCanceled: {
-                        delHoldTimer.stop()
-                        delBtn.colorOverlay = false
-                    }
-                    property bool colorOverlay: false
-
-                    Timer {
-                        id: delHoldTimer
-                        interval: 2000
-                        onTriggered: {
-                            delBtn.colorOverlay = false
-                            root.deleteAllCommands()
-                        }
-                    }
-                    contentItem: Column {
-                        spacing: 2
-                        anchors.centerIn: parent
-                        Text {
-                            text: "🗑"
-                            width: 60
-                            height: 18
-                            font.pixelSize: 15
-                            color: delBtn.colorOverlay ? root.cRed : root.cText
-                            horizontalAlignment: Text.AlignHCenter
-                            verticalAlignment: Text.AlignVCenter
-                        }
-                        Text {
-                            text: "删(Del)"
-                            width: 60
-                            height: 12
-                            font.pixelSize: 9
-                            color: root.cText
-                            horizontalAlignment: Text.AlignHCenter
-                            verticalAlignment: Text.AlignVCenter
-                        }
-                    }
-                    ToolTip.visible: delBtn.hovered
-                    ToolTip.delay: 600
-                    ToolTip.text: "短按: 删除选中指令\n长按2秒: 删除全部指令"
-                }
-                ToolButton {
-                    id: findBtn
-                    anchors.right: parent.right
-                    anchors.rightMargin: 188
-                    anchors.verticalCenter: parent.verticalCenter
-                    implicitWidth: 60
-                    implicitHeight: 52
-                    onClicked: findDialog.open()
-                    contentItem: Column {
-                        spacing: 2
-                        anchors.centerIn: parent
-                        Text {
-                            text: "🔍"
-                            width: 60
-                            height: 18
-                            font.pixelSize: 15
-                            color: root.cAccent
-                            horizontalAlignment: Text.AlignHCenter
-                            verticalAlignment: Text.AlignVCenter
-                        }
-                        Text {
-                            text: "查(Find)"
-                            width: 60
-                            height: 12
-                            font.pixelSize: 9
-                            color: root.cText
-                            horizontalAlignment: Text.AlignHCenter
-                            verticalAlignment: Text.AlignVCenter
-                        }
-                    }
-                }
-            }
-
-            // -------- 指令列表 --------
-            ListView {
-                id: commandList
-                anchors.top: cmdHeader.bottom
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.bottom: parent.bottom
-                clip: true
-                model: instructionModel
-                spacing: 1
-                ScrollBar.vertical: ScrollBar {}
-                highlightFollowsCurrentItem: true
-                highlightMoveDuration: 150
-                highlight: Rectangle {
-                    color: Qt.rgba(0, 0.66, 0.81, 0.22)
-                    radius: 4
-                }
-
-                delegate: Rectangle {
-                    width: commandList.width
-                    height: 68
-                    color: mouseArea2.pressed ? root.cSurface2 : root.cSurface
-
-                    MouseArea {
-                        id: mouseArea2
-                        anchors.fill: parent
-                        onClicked: {
-                            commandList.currentIndex = index      // 选中
-                            root.lastFound = index
-                        }
-                    }
-
-                    // 序号徽标
-                    Rectangle {
-                        width: 28
-                        height: 28
-                        radius: 14
-                        color: commandList.currentIndex === index ? root.cAccent : root.cSurface2
-                        anchors.left: parent.left
-                        anchors.leftMargin: 16
-                        anchors.verticalCenter: parent.verticalCenter
-                        Text {
-                            anchors.centerIn: parent
-                            text: index + 1
-                            color: "white"
-                            font.pixelSize: 12
-                            font.bold: true
-                        }
-                    }
-
-                    // 名称 / 指令内容 / 备注
-                    Column {
-                        anchors.left: parent.left
-                        anchors.leftMargin: 56
-                        anchors.right: parent.right
-                        anchors.rightMargin: 40
-                        anchors.verticalCenter: parent.verticalCenter
-                        spacing: 3
-
-                        Text {
-                            width: parent.width
-                            elide: Text.ElideRight
-                            text: model.name
-                            color: root.cText
-                            font.pixelSize: 15
-                            font.bold: true
-                        }
-                        Text {
-                            width: parent.width
-                            elide: Text.ElideRight
-                            text: model.command
-                            color: root.cAccent
-                            font.pixelSize: 13
-                            font.family: "Consolas"
-                        }
-                        Text {
-                            width: parent.width
-                            elide: Text.ElideRight
-                            visible: model.note !== ""
-                            text: model.note
-                            color: root.cSubtext
-                            font.pixelSize: 11
-                        }
-                    }
-
-                    // 右侧选中标记
-                    Text {
-                        anchors.right: parent.right
-                        anchors.rightMargin: 14
-                        anchors.verticalCenter: parent.verticalCenter
-                        text: commandList.currentIndex === index ? "●" : ""
-                        color: root.cAccent
-                        font.pixelSize: 12
-                    }
-
-                    Rectangle {
-                        width: parent.width
-                        height: 1
-                        color: root.cDivider
-                        anchors.bottom: parent.bottom
-                    }
-                }
-            }
         }
-
-        // ==================== 关于页 ====================
-        Item {
-            id: aboutPage
+        CommandPage {
+            id: commandPage
+            app: root
             visible: root.currentTab === 3
             anchors.top: parent.top
             anchors.left: parent.left
             anchors.right: parent.right
             anchors.bottom: bottomNav.top
-
-            // -------- 关于页顶栏 --------
-            Rectangle {
-                id: aboutHeader
-                width: parent.width
-                height: 56
-                color: root.cSurface
-                z: 10
-                Rectangle {
-                    width: parent.width
-                    height: 1
-                    color: root.cDivider
-                    anchors.bottom: parent.bottom
-                }
-                // 返回
-                ToolButton {
-                    anchors.left: parent.left
-                    anchors.leftMargin: 4
-                    anchors.verticalCenter: parent.verticalCenter
-                    implicitWidth: 44
-                    implicitHeight: 44
-                    onClicked: root.currentTab = 0
-                    contentItem: Text {
-                        text: "‹"
-                        font.pixelSize: 30
-                        color: root.cText
-                        horizontalAlignment: Text.AlignHCenter
-                        verticalAlignment: Text.AlignVCenter
-                    }
-                }
-                Text {
-                    anchors.left: parent.left
-                    anchors.leftMargin: 52
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: "关于 (About)"
-                    color: root.cText
-                    font.pixelSize: 16
-                    font.bold: true
-                }
-            }
-
-            // -------- 关于内容 --------
-            Column {
-                anchors.centerIn: parent
-                spacing: 8
-                Image {
-                    width: 80
-                    height: 80
-                    anchors.horizontalCenter: parent.horizontalCenter
-                    source: "qrc:/qt/qml/BLE_SAR/icons/tubiao.png"
-                    sourceSize.width: 160
-                    sourceSize.height: 160
-                    fillMode: Image.PreserveAspectFit
-                    antialiasing: true
-                }
-                Text { anchors.horizontalCenter: parent.horizontalCenter; text: "BLE-SAR"; color: root.cText; font.pixelSize: 22; font.bold: true }
-                Text { anchors.horizontalCenter: parent.horizontalCenter; text: "Version 1.0.0"; color: root.cSubtext; font.pixelSize: 13 }
-                Text { anchors.horizontalCenter: parent.horizontalCenter; text: "做您最舒心的蓝牙调试助手"; color: root.cSubtext; font.pixelSize: 13 }
-            }
+        }
+        AboutPage {
+            id: aboutPage
+            app: root
+            visible: root.currentTab === 4
+            anchors.top: parent.top
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: bottomNav.top
         }
 
         // ==================== 底部导航 ====================
@@ -1273,11 +409,12 @@ Window {
                     model: [
                         { label: "扫描(Scan)",    icon: "📡" },
                         { label: "广播(Advert)",  icon: "📢" },
+                        { label: "调试(Debug)",   icon: "🔧" },
                         { label: "指令(Commands)", icon: "⚙" },
                         { label: "关于(About)",   icon: "ℹ" }
                     ]
                     delegate: Item {
-                        width: bottomNav.width / 4
+                        width: bottomNav.width / 5
                         height: bottomNav.height
                         MouseArea {
                             anchors.fill: parent
@@ -1287,277 +424,24 @@ Window {
                             anchors.centerIn: parent
                             spacing: 2
                             Text {
-                                anchors.horizontalCenter: parent.horizontalCenter
+                                width: bottomNav.width / 5
                                 text: modelData.icon
                                 font.pixelSize: 18
                                 color: root.currentTab === index ? root.cAccent : root.cSubtext
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
                             }
                             Text {
-                                anchors.horizontalCenter: parent.horizontalCenter
+                                width: bottomNav.width / 5 - 8
                                 text: modelData.label
                                 font.pixelSize: 11
                                 color: root.currentTab === index ? root.cAccent : root.cSubtext
                                 font.bold: root.currentTab === index
+                                horizontalAlignment: Text.AlignHCenter
+                                elide: Text.ElideRight
                             }
                         }
                     }
-                }
-            }
-        }
-    }
-
-    // =================================================================
-    // 过滤对话框（扫描页：按 RSSI / MAC 地址 / 蓝牙名称过滤）
-    // 注意：header 属性是 Dialog 专有（Dialog 继承自 Popup），
-    // 若用 Popup 声明会导致 QML 加载失败、程序启动闪退。
-    // =================================================================
-    Dialog {
-        id: filterDialog
-        anchors.centerIn: parent
-        modal: true
-        width: Math.min(root.width - 32, 400)
-        padding: 16
-
-        // 信号强度阈值选择（对话框内临时值，应用时写入 root）
-        property int rssiSel: -127
-        onOpened: {
-            filterDialog.rssiSel = root.filterMinRssi
-            filterMacField.text = root.filterAddress
-            filterNameField.text = root.filterName
-        }
-
-        background: Rectangle { color: root.cSurface; radius: 12 }
-        header: Rectangle {
-            width: parent.width
-            height: 48
-            color: "transparent"
-            Text {
-                anchors.left: parent.left
-                anchors.leftMargin: 16
-                anchors.verticalCenter: parent.verticalCenter
-                text: "设备过滤 (Filter)"
-                color: root.cText
-                font.pixelSize: 16
-                font.bold: true
-            }
-        }
-
-        contentItem: Column {
-            spacing: 14
-            // 信号强度阈值
-            Text { text: "信号强度 (RSSI)"; color: root.cSubtext; font.pixelSize: 13 }
-            Row {
-                spacing: 6
-                Repeater {
-                    model: [
-                        { label: "全部",  v: -127 },
-                        { label: ">-50",  v: -50 },
-                        { label: ">-60",  v: -60 },
-                        { label: ">-70",  v: -70 },
-                        { label: ">-80",  v: -80 },
-                        { label: ">-90",  v: -90 }
-                    ]
-                    Rectangle {
-                        width: 50
-                        height: 30
-                        radius: 15
-                        color: filterDialog.rssiSel === modelData.v ? root.cAccent : root.cSurface2
-                        Text {
-                            anchors.centerIn: parent
-                            text: modelData.label
-                            color: "white"
-                            font.pixelSize: 12
-                            font.bold: filterDialog.rssiSel === modelData.v
-                        }
-                        MouseArea {
-                            anchors.fill: parent
-                            onClicked: filterDialog.rssiSel = modelData.v
-                        }
-                    }
-                }
-            }
-            // MAC 地址过滤
-            Text { text: "MAC 地址包含"; color: root.cSubtext; font.pixelSize: 13 }
-            TextField {
-                id: filterMacField
-                width: parent.width
-                height: 36
-                placeholderText: "如: A4:C1:38 (留空不过滤)"
-                placeholderTextColor: root.cSubtext
-                color: root.cText
-                font.pixelSize: 13
-                background: Rectangle { color: root.cSurface2; radius: 4; border.color: root.cDivider }
-            }
-            // 名称过滤
-            Text { text: "蓝牙名称包含"; color: root.cSubtext; font.pixelSize: 13 }
-            TextField {
-                id: filterNameField
-                width: parent.width
-                height: 36
-                placeholderText: "如: BLE (留空不过滤)"
-                placeholderTextColor: root.cSubtext
-                color: root.cText
-                font.pixelSize: 13
-                background: Rectangle { color: root.cSurface2; radius: 4; border.color: root.cDivider }
-            }
-            // 操作按钮
-            Row {
-                anchors.horizontalCenter: parent.horizontalCenter
-                spacing: 16
-                Button {
-                    text: "重置 (Reset)"
-                    onClicked: root.resetFilter()
-                    contentItem: Text { text: parent.text; color: root.cSubtext; font.pixelSize: 14 }
-                    background: Rectangle { color: root.cSurface2; radius: 16; width: 130; height: 32 }
-                }
-                Button {
-                    text: "应用 (Apply)"
-                    onClicked: root.applyFilter()
-                    contentItem: Text { text: parent.text; color: "white"; font.pixelSize: 14; font.bold: true }
-                    background: Rectangle { color: root.cAccent; radius: 16; width: 130; height: 32 }
-                }
-            }
-        }
-    }
-
-    // =================================================================
-    // 编辑对话框（新增 / 修改 共用）
-    // =================================================================
-    Dialog {
-        id: editDialog
-        anchors.centerIn: parent
-        modal: true
-        width: 360
-        padding: 16
-        property bool isNew: true
-        property string titleText: ""
-
-        background: Rectangle { color: root.cSurface; radius: 12 }
-        header: Rectangle {
-            width: parent.width
-            height: 48
-            color: "transparent"
-            Text {
-                anchors.left: parent.left
-                anchors.leftMargin: 16
-                anchors.verticalCenter: parent.verticalCenter
-                text: editDialog.titleText
-                color: root.cText
-                font.pixelSize: 16
-                font.bold: true
-            }
-        }
-
-        contentItem: Column {
-            spacing: 12
-            TextField {
-                id: editNameField
-                width: parent.width
-                placeholderText: "指令名称 (如: 读取电量)"
-                placeholderTextColor: root.cSubtext
-                color: root.cText
-                font.pixelSize: 14
-                background: Rectangle {
-                    color: root.cSurface2
-                    radius: 4
-                    border.color: root.cDivider
-                }
-            }
-            TextField {
-                id: editCmdField
-                width: parent.width
-                placeholderText: "指令内容 (如: AT+VBAT?)"
-                placeholderTextColor: root.cSubtext
-                color: root.cAccent
-                font.pixelSize: 14
-                background: Rectangle {
-                    color: root.cSurface2
-                    radius: 4
-                    border.color: root.cDivider
-                }
-            }
-            Row {
-                anchors.horizontalCenter: parent.horizontalCenter
-                spacing: 16
-                Button {
-                    text: "取消 (Cancel)"
-                    onClicked: editDialog.close()
-                    contentItem: Text { text: parent.text; color: root.cSubtext; font.pixelSize: 14 }
-                    background: Rectangle { color: root.cSurface2; radius: 16; width: 130; height: 32 }
-                }
-                Button {
-                    text: "确定 (OK)"
-                    onClicked: root.saveEdit()
-                    contentItem: Text { text: parent.text; color: "white"; font.pixelSize: 14; font.bold: true }
-                    background: Rectangle { color: root.cAccent; radius: 16; width: 130; height: 32 }
-                }
-            }
-        }
-    }
-
-    // =================================================================
-    // 查找对话框
-    // =================================================================
-    Dialog {
-        id: findDialog
-        anchors.centerIn: parent
-        modal: true
-        width: 360
-        padding: 16
-        onOpened: findField.forceActiveFocus()
-
-        background: Rectangle { color: root.cSurface; radius: 12 }
-        header: Rectangle {
-            width: parent.width
-            height: 48
-            color: "transparent"
-            Text {
-                anchors.left: parent.left
-                anchors.leftMargin: 16
-                anchors.verticalCenter: parent.verticalCenter
-                text: "查找指令 (Find)"
-                color: root.cText
-                font.pixelSize: 16
-                font.bold: true
-            }
-        }
-
-        contentItem: Column {
-            spacing: 12
-            TextField {
-                id: findField
-                width: parent.width
-                placeholderText: "输入名称/内容关键字…"
-                placeholderTextColor: root.cSubtext
-                color: root.cText
-                font.pixelSize: 14
-                onAccepted: {
-                    root.locateCommands(findField.text)
-                    findDialog.close()
-                }
-                background: Rectangle {
-                    color: root.cSurface2
-                    radius: 4
-                    border.color: root.cDivider
-                }
-            }
-            Row {
-                anchors.horizontalCenter: parent.horizontalCenter
-                spacing: 16
-                Button {
-                    text: "取消 (Cancel)"
-                    onClicked: findDialog.close()
-                    contentItem: Text { text: parent.text; color: root.cSubtext; font.pixelSize: 14 }
-                    background: Rectangle { color: root.cSurface2; radius: 16; width: 130; height: 32 }
-                }
-                Button {
-                    text: "查找 (Find)"
-                    onClicked: {
-                        root.locateCommands(findField.text)
-                        findDialog.close()
-                    }
-                    contentItem: Text { text: parent.text; color: "white"; font.pixelSize: 14; font.bold: true }
-                    background: Rectangle { color: root.cAccent; radius: 16; width: 130; height: 32 }
                 }
             }
         }
@@ -1573,7 +457,8 @@ Window {
             for (var i = 0; i < deviceModel.count; i++)
                 if (deviceModel.get(i).address === address) return
             deviceModel.append({ name: name, address: address, rssi: rssi,
-                                 connected: false, isConnectable: isLe })
+                                 connected: false, connecting: false,
+                                 isConnectable: isLe })
             root.rebuildViewModel()
         }
         // 扫描 / 广播 / 连接 状态变化驱动 UI
@@ -1590,20 +475,72 @@ Window {
         // 外设被其它设备连接 / 断开
         function onPeripheralConnectedChanged(v) {
             root.peripheralConnected = v
+            // 连接信息同步到指令页日志文本框（绿字 + 设备信息）
+            root.logPeripheral(v)
             root.showToast(v ? "有设备已连接，可收发数据" : "设备已断开连接")
+            // 作为从设备被其它主设备连接后自动跳转到调试终端
+            if (v) root.currentTab = 2
         }
         // 外设收到已连接设备写入的数据
         function onPeripheralDataReceived(data) {
             root.showToast("收到数据: " + String(data))
         }
+        // Central 连接成功后服务发现完成：补充打印服务 UUID 到指令页日志
+        function onServicesDiscovered(services) {
+            root.logServices(services)
+        }
         // 广播 / 扫描 / 连接 错误或提示（含广播名称截断提示）
         function onErrorOccurred(message) {
+            // 正处于连接中时收到的错误按「连接失败」处理并展示具体原因
+            if (root.connectingAddress !== "") {
+                root.failConnect(root.connectingAddress,
+                                 "连接失败：" + message)
+                return
+            }
+            // 连接失败收口后 2.5 秒内的补充错误信号直接忽略，避免重复弹窗
+            if (Date.now() < root.suppressErrUntil) return
             root.showToast(message)
         }
         function onConnectedChanged(v) {
-            // 依据连接状态更新两个设备模型对应行
-            root.updateDeviceConnected(root.targetAddress, v)
-            root.showToast(v ? "已连接设备" : "已断开连接")
+            if (v) {
+                // 连接成功：复位「连接中」标记，再按原逻辑更新并跳转调试终端
+                connectTimeoutTimer.stop()
+                if (root.connectingAddress !== "") {
+                    root.setDeviceConnecting(root.connectingAddress, false)
+                    root.connectingAddress = ""
+                }
+                root.updateDeviceConnected(root.targetAddress, true)
+                // 连接信息打印到指令页日志文本框（绿字）
+                root.logConnected()
+                root.showToast("已连接设备")
+                root.currentTab = 2
+            } else {
+                // 断开分两类：
+                //  1) 连接尚未成功即失败（仍处于连接中）→ 弹失败提示
+                //  2) 已连接设备主动/被动断开 → 按原逻辑提示
+                if (root.connectingAddress !== "") {
+                    root.failConnect(root.connectingAddress,
+                        "连接失败：请确认设备已开机且在附近，然后重试")
+                    return
+                }
+                // 连接失败收口后残留的断连信号直接忽略，避免重复弹窗
+                if (Date.now() < root.suppressErrUntil) return
+                root.updateDeviceConnected(root.targetAddress, false)
+                // 断开日志同步到指令页日志文本框
+                root.logDisconnected()
+                root.showToast("已断开连接")
+            }
+        }
+    }
+
+    // 收发数据行镜像：BleTerminal 每追加一条记录（格式与调试文本框完全一致，
+    // 已按 十六进制/时间戳 开关处理）同步到指令页日志文本框，实现两个文本框
+    // 显示逻辑一致：收到(RX)用青色、本机发送(TX)用绿色。
+    Connections {
+        target: bleManager.terminal
+        function onDataLogged(display, receive) {
+            commandPage.appendLog((receive ? "[接收]: " : "[发送]: ") + display,
+                                  receive ? root.cAccent : root.cGreen)
         }
     }
 
@@ -1621,15 +558,20 @@ Window {
         }
         function onPermissionDenied(permission, message) {
             root.pendingAction = null
+            // 连接权限被拒：复位「连接中」状态并给出明确引导
+            if (permission === BlePermissions.ConnectPermission) {
+                root.clearConnecting()
+                root.showToast("连接权限被拒绝，无法连接设备。"
+                               + "请重试；若持续被拒请到系统设置开启「附近设备」权限。")
+                return
+            }
             // Android 上若用户勾选“不再询问”，需到系统设置手动开启；
             // 此处明确提示广播/扫描权限的用途，并鼓励重试。
             var hint = ""
             if (permission === BlePermissions.AdvertisePermission)
                 hint = "广播权限被拒绝，无法作为外设广播。请重试，若持续被拒请到系统设置开启「附近设备」权限。"
-            else if (permission === BlePermissions.ScanPermission)
-                hint = "扫描权限被拒绝，无法搜索设备。请重试。"
             else
-                hint = "连接权限被拒绝，无法连接设备。请重试。"
+                hint = "扫描权限被拒绝，无法搜索设备。请重试。"
             root.showToast(hint)
         }
     }

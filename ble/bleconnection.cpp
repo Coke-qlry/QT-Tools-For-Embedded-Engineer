@@ -4,7 +4,19 @@
 #include <QLowEnergyController>
 #include <QLowEnergyDescriptor>
 #include <QLowEnergyService>
+#include <QDebug>
+#include <QStringList>
+#include <QTimer>
 #include <QUuid>
+
+// [BLE-DBG] 调试日志总开关：置 1 恢复输出，置 0 静默（等效注释全部调试打印）。
+// 排查蓝牙连接 / 收发问题时改成 1 重新编译即可重新看到日志。
+#define BLE_DBG_ENABLED 0
+#if BLE_DBG_ENABLED
+#  define BLE_DBG_LOG() qDebug()
+#else
+#  define BLE_DBG_LOG() QNoDebug()
+#endif
 
 namespace {
 
@@ -28,6 +40,35 @@ QString serviceErrorToString(QLowEnergyService::ServiceError error)
         break;
     }
     return QStringLiteral("未知错误");
+}
+
+// 调试辅助：特征属性位 -> 可读文本
+QString propsToString(QLowEnergyCharacteristic::PropertyTypes props)
+{
+    QStringList flags;
+    if (props & QLowEnergyCharacteristic::Broadcasting)
+        flags << QLatin1String("Broadcast");
+    if (props & QLowEnergyCharacteristic::Read)
+        flags << QLatin1String("Read");
+    if (props & QLowEnergyCharacteristic::WriteNoResponse)
+        flags << QLatin1String("WriteNoResponse");
+    if (props & QLowEnergyCharacteristic::Write)
+        flags << QLatin1String("Write");
+    if (props & QLowEnergyCharacteristic::Notify)
+        flags << QLatin1String("Notify");
+    if (props & QLowEnergyCharacteristic::Indicate)
+        flags << QLatin1String("Indicate");
+    if (props & QLowEnergyCharacteristic::WriteSigned)
+        flags << QLatin1String("WriteSigned");
+    if (props & QLowEnergyCharacteristic::ExtendedProperty)
+        flags << QLatin1String("Extended");
+    return flags.join(QLatin1String("|"));
+}
+
+// 调试辅助：数据转大写十六进制文本（带空格分隔）
+QString dataToHex(const QByteArray &data)
+{
+    return QString::fromLatin1(data.toHex(' ').toUpper());
 }
 
 } // namespace
@@ -69,6 +110,8 @@ void BleConnection::connectToDevice(const QBluetoothDeviceInfo &info)
     // （onServiceDiscoveryFinished 中的 qDeleteAll）或 BleConnection 析构回收。
     m_services.clear();
     m_serviceObjects.clear();
+    // 清理上一次连接遗留的通知使能写入队列（队列中的服务对象即将失效）
+    resetNotifyQueue();
 
     m_controller = QLowEnergyController::createCentral(info, this);
     if (!m_controller) {
@@ -91,6 +134,9 @@ void BleConnection::connectToDevice(const QBluetoothDeviceInfo &info)
                                        : QStringLiteral("未知蓝牙错误"));
             });
 
+    BLE_DBG_LOG() << "[BLE-DBG] ======== 发起 GATT 连接 ========";
+    BLE_DBG_LOG() << "[BLE-DBG] 目标设备 name =" << info.name()
+             << " rssi =" << info.rssi();
     emit stateChanged(QStringLiteral("正在连接..."));
     m_controller->connectToDevice();
 }
@@ -100,6 +146,7 @@ void BleConnection::onConnected()
     // 忽略旧控制器（已 deleteLater 但尚未销毁）发出的迟到信号
     if (sender() != m_controller)
         return;
+    BLE_DBG_LOG() << "[BLE-DBG] <<<<< GATT 链路已连接 >>>>>";
     m_connected = true;
     emit connectedChanged(true);
     emit stateChanged(QStringLiteral("已连接"));
@@ -111,6 +158,8 @@ void BleConnection::onDisconnected()
     if (sender() != m_controller)
         return;
     m_connected = false;
+    // 断连后取消未完成的通知使能写入
+    resetNotifyQueue();
     emit connectedChanged(false);
     emit stateChanged(QStringLiteral("已断开"));
 }
@@ -145,12 +194,14 @@ void BleConnection::onServiceDiscoveryFinished()
     m_services.clear();
 
     const QList<QBluetoothUuid> uuids = m_controller->services();
+    BLE_DBG_LOG() << "[BLE-DBG] 服务发现完成，共" << uuids.size() << "个服务:";
     for (const QBluetoothUuid &uuid : uuids) {
         QLowEnergyService *service = m_controller->createServiceObject(uuid, this);
         if (service) {
             setupServiceObject(service);
             m_services.insert(uuid, service);
             m_serviceObjects.append(service);
+            BLE_DBG_LOG() << "[BLE-DBG]     [service] " << uuidString(uuid);
         }
     }
 
@@ -168,10 +219,21 @@ void BleConnection::setupServiceObject(QLowEnergyService *service)
             this, &BleConnection::onCharacteristicRead);
     connect(service, &QLowEnergyService::characteristicWritten,
             this, &BleConnection::onCharacteristicWritten);
+    connect(service, &QLowEnergyService::descriptorWritten,
+            this, &BleConnection::onNotifyDescriptorWritten);
     connect(service,
             QOverload<QLowEnergyService::ServiceError>::of(
                 &QLowEnergyService::errorOccurred),
             this, [this](QLowEnergyService::ServiceError error) {
+                // CCCD 通知使能写入失败：交给通知队列统一重试处理
+                // （自动开启多个通知时，失败通常由并发写引起，重试即可恢复，
+                // 不在这里重复弹出“服务错误”干扰用户）
+                if (error == QLowEnergyService::DescriptorWriteError
+                    && m_notifyBusy
+                    && sender() == m_activeNotify.service) {
+                    finishNotifyWrite(false);
+                    return;
+                }
                 emit errorOccurred(
                     QStringLiteral("服务错误: %1")
                         .arg(serviceErrorToString(error)));
@@ -183,8 +245,20 @@ void BleConnection::onServiceStateChanged(QLowEnergyService::ServiceState state)
     if (state != QLowEnergyService::RemoteServiceDiscovered)
         return;
     const auto *service = qobject_cast<QLowEnergyService *>(sender());
-    if (service)
-        emit detailsDiscovered(uuidString(service->serviceUuid()));
+    if (!service)
+        return;
+    BLE_DBG_LOG() << "[BLE-DBG] ---- 服务详情发现完成:"
+             << uuidString(service->serviceUuid());
+    const QList<QLowEnergyCharacteristic> chars = service->characteristics();
+    for (const QLowEnergyCharacteristic &c : chars) {
+        const QLowEnergyDescriptor cccd = c.descriptor(
+            QBluetoothUuid::DescriptorType::ClientCharacteristicConfiguration);
+        BLE_DBG_LOG() << "[BLE-DBG]     [char] uuid =" << uuidString(c.uuid())
+                 << " name =" << c.name()
+                 << " props =" << propsToString(c.properties())
+                 << (cccd.isValid() ? " [有CCCD可订阅]" : " [无CCCD]");
+    }
+    emit detailsDiscovered(uuidString(service->serviceUuid()));
 }
 
 void BleConnection::discoverDetails(const QString &serviceUuid)
@@ -194,6 +268,7 @@ void BleConnection::discoverDetails(const QString &serviceUuid)
         emit errorOccurred(QStringLiteral("服务不存在: %1").arg(serviceUuid));
         return;
     }
+    BLE_DBG_LOG() << "[BLE-DBG] >>> 请求发现服务详情(discoverDetails):" << serviceUuid;
     service->discoverDetails();
 }
 
@@ -263,6 +338,8 @@ void BleConnection::readCharacteristic(const QString &serviceUuid,
         emit errorOccurred(QStringLiteral("特征不存在: %1").arg(charUuid));
         return;
     }
+    BLE_DBG_LOG() << "[BLE-DBG] >>> 主动读取(Read请求): service =" << serviceUuid
+             << " char =" << charUuid;
     service->readCharacteristic(c);
 }
 
@@ -284,7 +361,19 @@ void BleConnection::writeCharacteristic(const QString &serviceUuid,
         emit errorOccurred(QStringLiteral("特征不存在: %1").arg(charUuid));
         return;
     }
-    service->writeCharacteristic(c, data, QLowEnergyService::WriteWithResponse);
+    const bool withResponse =
+        bool(c.properties() & QLowEnergyCharacteristic::Write);
+    const bool noResponse =
+        bool(c.properties() & QLowEnergyCharacteristic::WriteNoResponse);
+    if (!withResponse && !noResponse) {
+        emit errorOccurred(QStringLiteral("所选特征不支持写入(Write)"));
+        return;
+    }
+    // 优先按特征自身能力决定写入模式，避免只支持
+    // WriteNoResponse 的特征用 WriteWithResponse 写入失败。
+    service->writeCharacteristic(
+        c, data, withResponse ? QLowEnergyService::WriteWithResponse
+                              : QLowEnergyService::WriteWithoutResponse);
 }
 
 void BleConnection::enableNotify(const QString &serviceUuid,
@@ -308,19 +397,163 @@ void BleConnection::enableNotify(const QString &serviceUuid,
     const QLowEnergyDescriptor cccd = c.descriptor(
         QBluetoothUuid::DescriptorType::ClientCharacteristicConfiguration);
     if (!cccd.isValid()) {
-        emit errorOccurred(QStringLiteral("该特征不支持通知(Notify)"));
+        // 关键：Qt 在部分 Android 机型/蓝牙栈上读不到 CCCD 描述符
+        // （即使特征属性声明了 Notify）。此时必须把"通知不可用"同步给目录，
+        // 否则界面会误以为通知已开启，导致可读特征连自动轮询回退也被禁用，
+        // 最终只能手动点"读取"。
+        BLE_DBG_LOG() << "[BLE-DBG] !!! enableNotify被拒: 该特征无CCCD描述符"
+                 << "(Android上偶发), 无法订阅通知: service =" << serviceUuid
+                 << " char =" << charUuid
+                 << " 可读 =" << bool(c.properties()
+                                      & QLowEnergyCharacteristic::Read);
+        const bool readableProp = bool(
+            c.properties() & QLowEnergyCharacteristic::Read);
+        emit notifyChanged(serviceUuid, charUuid, enable, false);
+        emit errorOccurred(
+            readableProp
+                ? QStringLiteral("该特征通知开启失败，已自动改用轮询读取")
+                : QStringLiteral("该特征不支持通知(Notify)"));
         return;
     }
     // 0x0001 = Notifications, 0x0002 = Indications
-    const QByteArray value = enable ? QByteArray::fromHex("0100")
-                                    : QByteArray::fromHex("0000");
-    service->writeDescriptor(cccd, value);
+    NotifyWrite w;
+    w.service = service;
+    w.characteristic = c;
+    w.enable = enable;
+    w.value = enable ? QByteArray::fromHex("0100")
+                     : QByteArray::fromHex("0000");
+    BLE_DBG_LOG() << "[BLE-DBG] >>> enableNotify(" << (enable ? "开" : "关")
+             << ") service =" << serviceUuid
+             << " char =" << charUuid
+             << " props =" << propsToString(c.properties());
+    // 入队串行写入，避免多条连接上并发 GATT 写导致部分通知开启失败
+    m_notifyQueue.append(w);
+    pumpNotifyQueue();
+}
+
+// ---------------------------------------------------------------------
+// 通知(CCCD)写入队列：每次只发一个写请求，前一个完成后才发下一个
+// ---------------------------------------------------------------------
+void BleConnection::pumpNotifyQueue()
+{
+    if (m_notifyBusy || m_notifyQueue.isEmpty())
+        return;
+    m_activeNotify = m_notifyQueue.takeFirst();
+    m_notifyBusy = true;
+
+    if (!m_notifyTimeout) {
+        m_notifyTimeout = new QTimer(this);
+        m_notifyTimeout->setSingleShot(true);
+        m_notifyTimeout->setInterval(8000);   // 8s 无回执视为失败
+        connect(m_notifyTimeout, &QTimer::timeout,
+                this, &BleConnection::onNotifyQueueTimeout);
+    }
+    m_notifyTimeout->start();
+
+    const QLowEnergyDescriptor cccd = m_activeNotify.characteristic.descriptor(
+        QBluetoothUuid::DescriptorType::ClientCharacteristicConfiguration);
+    BLE_DBG_LOG() << "[BLE-DBG] === 开始写CCCD(订阅): service ="
+             << uuidString(m_activeNotify.service->serviceUuid())
+             << " char =" << uuidString(m_activeNotify.characteristic.uuid())
+             << " 写入值 =" << dataToHex(m_activeNotify.value)
+             << "(0100=Notify 0200=Indicate)";
+    m_activeNotify.service->writeDescriptor(cccd, m_activeNotify.value);
+}
+
+void BleConnection::onNotifyDescriptorWritten(
+    const QLowEnergyDescriptor &descriptor, const QByteArray &value)
+{
+    Q_UNUSED(value);
+    if (!m_notifyBusy)
+        return;
+    const auto *service = qobject_cast<QLowEnergyService *>(sender());
+    if (service != m_activeNotify.service)
+        return;
+    if (descriptor.uuid()
+        != QBluetoothUuid::DescriptorType::ClientCharacteristicConfiguration)
+        return;
+    // 注意：不校验回执 value 是否与写入值一致。部分 Android 机型/蓝牙栈
+    // 的回执值可能与请求值不同，若严格比对会把成功的 CCCD 写入误判为失败，
+    // 导致自动通知未生效、只能手动点"读取"才有数据。
+    finishNotifyWrite(true);
+}
+
+void BleConnection::onNotifyQueueTimeout()
+{
+    if (m_notifyBusy)
+        finishNotifyWrite(false);
+}
+
+void BleConnection::finishNotifyWrite(bool success)
+{
+    if (!m_notifyBusy)
+        return;
+    if (m_notifyTimeout)
+        m_notifyTimeout->stop();
+    NotifyWrite finished = m_activeNotify;
+    m_activeNotify = NotifyWrite();
+    m_notifyBusy = false;
+
+    if (!success && finished.retries > 0) {
+        BLE_DBG_LOG() << "[BLE-DBG] !!! CCCD订阅写入失败，100ms后自动重试一次: char ="
+                 << uuidString(finished.characteristic.uuid());
+        // CCCD 写入偶发失败（连接拥挤 / 设备繁忙）：短暂延迟后重试一次
+        --finished.retries;
+        m_notifyQueue.prepend(finished);
+        QTimer::singleShot(100, this, &BleConnection::pumpNotifyQueue);
+        return;
+    }
+    if (!success) {
+        BLE_DBG_LOG() << "[BLE-DBG] !!! CCCD订阅写入最终失败(重试耗尽): service ="
+                 << uuidString(finished.service->serviceUuid())
+                 << " char =" << uuidString(finished.characteristic.uuid())
+                 << " enable =" << finished.enable;
+        // 重试耗尽仍失败：告知界面该特征通知未生效。
+        // 若特征可读，界面会自动回退为“轮询读取”，数据仍能自动收到；
+        // 不可读则只能提示用户手动处理。
+        emit notifyChanged(uuidString(finished.service->serviceUuid()),
+                           uuidString(finished.characteristic.uuid()),
+                           finished.enable, false);
+        if (finished.enable) {
+            const bool readable = bool(
+                finished.characteristic.properties()
+                & QLowEnergyCharacteristic::Read);
+            emit errorOccurred(
+                readable ? QStringLiteral("该特征通知开启失败，已自动改用轮询读取")
+                         : QStringLiteral("自动开启通知失败，"
+                                          "可展开「服务与特征」手动开启"));
+        }
+    } else {
+        BLE_DBG_LOG() << "[BLE-DBG] +++ CCCD订阅写入成功: service ="
+                 << uuidString(finished.service->serviceUuid())
+                 << " char =" << uuidString(finished.characteristic.uuid())
+                 << " enable =" << finished.enable;
+        emit notifyChanged(uuidString(finished.service->serviceUuid()),
+                           uuidString(finished.characteristic.uuid()),
+                           finished.enable, true);
+    }
+    pumpNotifyQueue();
+}
+
+void BleConnection::resetNotifyQueue()
+{
+    m_notifyQueue.clear();
+    m_activeNotify = NotifyWrite();
+    m_notifyBusy = false;
+    if (m_notifyTimeout)
+        m_notifyTimeout->stop();
 }
 
 void BleConnection::onCharacteristicChanged(
     const QLowEnergyCharacteristic &characteristic, const QByteArray &newValue)
 {
     const auto *service = qobject_cast<QLowEnergyService *>(sender());
+    // 通知/指示推送到达：说明 CCCD 订阅已生效，设备在主动上报
+    BLE_DBG_LOG() << "[BLE-DBG] <<< 【通知推送 NOTIFY】 service ="
+             << (service ? uuidString(service->serviceUuid()) : QString())
+             << " char =" << uuidString(characteristic.uuid())
+             << " len =" << newValue.size()
+             << " hex =" << dataToHex(newValue);
     emit dataReceived(service ? uuidString(service->serviceUuid()) : QString(),
                       uuidString(characteristic.uuid()), newValue);
 }
@@ -329,6 +562,12 @@ void BleConnection::onCharacteristicRead(
     const QLowEnergyCharacteristic &characteristic, const QByteArray &value)
 {
     const auto *service = qobject_cast<QLowEnergyService *>(sender());
+    // Read 回包到达：由"手动点读取"或"自动轮询读取"触发
+    BLE_DBG_LOG() << "[BLE-DBG] <<< 【读取回包 READ】 service ="
+             << (service ? uuidString(service->serviceUuid()) : QString())
+             << " char =" << uuidString(characteristic.uuid())
+             << " len =" << value.size()
+             << " hex =" << dataToHex(value);
     emit dataReceived(service ? uuidString(service->serviceUuid()) : QString(),
                       uuidString(characteristic.uuid()), value);
 }

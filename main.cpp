@@ -12,6 +12,7 @@
 
 #include "ble/blemanager.h"
 #include "ble/blepermissions.h"
+#include "sqlite/SQLite.h"
 
 #ifdef Q_OS_ANDROID
 #include <android/log.h>
@@ -108,8 +109,21 @@ int main(int argc, char *argv[])
     BleManager bleManager;
     qInfo() << "BLE 后端初始化完成";
 
+    // SQLite 配置仓库：QML 中通过全局对象 sqliteWarehouse 访问，例如
+    //   sqliteWarehouse.create_sqlite_warehouse("ble_command_config");
+    //   sqliteWarehouse.create_sqlite_wh_config_json(
+    //       "ble_command_config", JSON.stringify(["command_name", "command_self"]));
+    //   sqliteWarehouse.add_sqlite_wh_config_json(
+    //       "ble_command_config", JSON.stringify(["读取电量", "AT+VBAT?"]));
+    // 说明：QML 侧字段/值一律用 JSON.stringify 编码为字符串传入（_json 系列接口），
+    // 直接传 JS 数组在真机上会被转成空值（详见 sqlite/SQLite.h 顶部注释）
+    // 详见 sqlite/SQLite.h 顶部注释
+    SqliteWarehouse sqliteWarehouse;
+    qInfo() << "SQLite 配置仓库目录:" << sqliteWarehouse.warehouseDir();
+
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty("bleManager", &bleManager);
+    engine.rootContext()->setContextProperty("sqliteWarehouse", &sqliteWarehouse);
     // 注册权限枚举类型，QML 中可用 bleManager.permissions.requestPermission(
     // BlePermissions.ConnectPermission) 等方式请求权限
     qmlRegisterType<BlePermissions>("BLE_SAR.Ble", 1, 0, "BlePermissions");

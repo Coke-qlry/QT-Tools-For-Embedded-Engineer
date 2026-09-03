@@ -4,6 +4,7 @@
 #include "bleconnection.h"
 #include "blepermissions.h"
 #include "blescanner.h"
+#include "bleterminal.h"
 
 #include <QBluetoothDeviceInfo>
 
@@ -14,6 +15,7 @@ BleManager::BleManager(QObject *parent)
     m_scanner = new BleScanner(this);
     m_advertiser = new BleAdvertiser(this);
     m_connection = new BleConnection(this);
+    m_terminal = new BleTerminal(this);
 
     // 扫描模块信号转发
     connect(m_scanner, &BleScanner::deviceFound,
@@ -50,8 +52,20 @@ BleManager::BleManager(QObject *parent)
             this, &BleManager::dataReceived);
     connect(m_connection, &BleConnection::dataWritten,
             this, &BleManager::dataWritten);
+    connect(m_connection, &BleConnection::notifyChanged,
+            this, &BleManager::notifyChanged);
     connect(m_connection, &BleConnection::errorOccurred,
             this, &BleManager::errorOccurred);
+
+    // 调试终端模块：监听连接状态与收发的数据
+    connect(this, &BleManager::connectedChanged,
+            m_terminal, &BleTerminal::setCentralConnected);
+    connect(this, &BleManager::peripheralConnectedChanged,
+            m_terminal, &BleTerminal::setPeripheralConnected);
+    connect(this, &BleManager::dataReceived,
+            m_terminal, &BleTerminal::onCentralData);
+    connect(m_advertiser, &BleAdvertiser::dataReceived,
+            m_terminal, &BleTerminal::onPeripheralData);
 }
 
 bool BleManager::scanning() const
@@ -88,6 +102,11 @@ void BleManager::refreshLocalDeviceName()
 BlePermissions *BleManager::permissions() const
 {
     return m_permissions;
+}
+
+BleTerminal *BleManager::terminal() const
+{
+    return m_terminal;
 }
 
 bool BleManager::hasPermission(int permission) const

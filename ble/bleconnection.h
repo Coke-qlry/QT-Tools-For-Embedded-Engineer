@@ -24,6 +24,8 @@ QT_BEGIN_NAMESPACE
 class QLowEnergyController;
 QT_END_NAMESPACE
 
+class QTimer;
+
 class BleConnection : public QObject
 {
     Q_OBJECT
@@ -68,6 +70,11 @@ signals:
     void dataWritten(const QString &serviceUuid,
                      const QString &charUuid,
                      const QByteArray &data);
+    // 通知(CCCD)写入最终结果（成功或重试耗尽后的失败）：
+    // 通知界面据此同步“通知开/关”状态；失败时界面会把该特征
+    // 回退为“自动轮询读取”，保证只读型特征也能自动收数据。
+    void notifyChanged(const QString &serviceUuid, const QString &charUuid,
+                       bool enabled, bool success);
 
 private slots:
     void onConnected();
@@ -80,6 +87,10 @@ private slots:
                               const QByteArray &value);
     void onCharacteristicWritten(const QLowEnergyCharacteristic &characteristic,
                                  const QByteArray &newValue);
+    // CCCD（通知使能描述符）写入完成 / 队列超时（串行自动开启通知用）
+    void onNotifyDescriptorWritten(const QLowEnergyDescriptor &descriptor,
+                                   const QByteArray &value);
+    void onNotifyQueueTimeout();
 
 private:
     QLowEnergyService *findService(const QBluetoothUuid &uuid) const;
@@ -87,6 +98,27 @@ private:
                                                 const QString &charUuid) const;
     void setupServiceObject(QLowEnergyService *service);
     static QString uuidString(const QBluetoothUuid &uuid);
+
+    // 通知(CCCD)使能写入串行化：
+    // Android BLE 不允许对同一条连接并发发起多个 GATT 写操作，
+    // 连接后自动开启多个特征通知时若连续 writeDescriptor，后面的会失败，
+    // 导致用户还需手动去「服务与特征」里逐个点开。这里改为队列逐一执行，
+    // 前一个完成（descriptorWritten/失败/超时）后再写下一个。
+    struct NotifyWrite {
+        QLowEnergyService *service = nullptr;
+        QLowEnergyCharacteristic characteristic;
+        QByteArray value;
+        bool enable = true;   // 本次请求是开启还是关闭通知
+        int retries = 1;      // 失败后自动重试次数
+    };
+    void resetNotifyQueue();
+    void pumpNotifyQueue();               // 队列空闲则取下一个执行
+    void finishNotifyWrite(bool success); // 完成一次写入，驱动队列
+
+    QList<NotifyWrite> m_notifyQueue;
+    NotifyWrite m_activeNotify;
+    bool m_notifyBusy = false;
+    QTimer *m_notifyTimeout = nullptr;
 
     QLowEnergyController *m_controller = nullptr;
     QList<QLowEnergyService *> m_serviceObjects;

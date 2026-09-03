@@ -15,6 +15,7 @@
 #include <QVariantList>
 
 #include "blepermissions.h"
+#include "bleterminal.h"
 
 class BleScanner;
 class BleAdvertiser;
@@ -33,6 +34,8 @@ class BleManager : public QObject
     Q_PROPERTY(QString localDeviceName READ localDeviceName
                NOTIFY localDeviceNameChanged)
     Q_PROPERTY(BlePermissions *permissions READ permissions CONSTANT)
+    // 调试终端模块（数据收发 / 十六进制 / 定时发送 / 导出）
+    Q_PROPERTY(BleTerminal *terminal READ terminal CONSTANT)
 
 public:
     explicit BleManager(QObject *parent = nullptr);
@@ -49,6 +52,8 @@ public:
 
     // 返回权限管理对象（QML 通过 bleManager.permissions 访问）
     BlePermissions *permissions() const;
+    // 返回调试终端对象（QML 通过 bleManager.terminal 访问）
+    BleTerminal *terminal() const;
 
     // ---- 权限辅助（转发到 BlePermissions）----
     Q_INVOKABLE bool hasPermission(int permission) const;
@@ -105,6 +110,9 @@ signals:
                       const QByteArray &data);
     void dataWritten(const QString &serviceUuid, const QString &charUuid,
                      const QByteArray &data);
+    // 通知(CCCD)使能的最终结果（界面同步开关；失败时自动回退轮询读取）
+    void notifyChanged(const QString &serviceUuid, const QString &charUuid,
+                       bool enabled, bool success);
     void errorOccurred(const QString &message);
 
 private:
@@ -112,4 +120,5 @@ private:
     BleScanner *m_scanner = nullptr;
     BleAdvertiser *m_advertiser = nullptr;
     BleConnection *m_connection = nullptr;
+    BleTerminal *m_terminal = nullptr;
 };

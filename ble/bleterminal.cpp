@@ -188,6 +188,19 @@ QString BleTerminal::bytesToHex(const QByteArray &data)
     return out;
 }
 
+QString BleTerminal::bytesToHexNoSpace(const QByteArray &data)
+{
+    // 无分隔的十六进制：便于直接复制粘贴到串口工具 / 文档中使用
+    QString out;
+    out.reserve(data.size() * 2);
+    for (int i = 0; i < data.size(); ++i) {
+        out += QStringLiteral("%1")
+                   .arg(uchar(data.at(i)), 2, 16, QLatin1Char('0'))
+                   .toUpper();
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------------
 // 连接状态
 // ---------------------------------------------------------------------
@@ -195,7 +208,26 @@ void BleTerminal::setHexReceive(bool on)
 {
     if (m_hexReceive != on) {
         m_hexReceive = on;
+        // 两个十六进制接收开关互斥：开启带空格时自动关闭无空格，
+        // 避免 appendReceived 在两个开关都为 true 时不知用哪个格式
+        if (on && m_hexReceiveNoSpace)
+            m_hexReceiveNoSpace = false;
         emit hexReceiveChanged();
+        if (on && m_hexReceiveNoSpace == false)
+            emit hexReceiveNoSpaceChanged();
+    }
+}
+
+void BleTerminal::setHexReceiveNoSpace(bool on)
+{
+    if (m_hexReceiveNoSpace != on) {
+        m_hexReceiveNoSpace = on;
+        // 互斥：开启无空格时自动关闭带空格
+        if (on && m_hexReceive)
+            m_hexReceive = false;
+        emit hexReceiveNoSpaceChanged();
+        if (on && m_hexReceive == false)
+            emit hexReceiveChanged();
     }
 }
 
@@ -618,10 +650,16 @@ void BleTerminal::appendReceived(const QByteArray &raw)
 {
     if (raw.isEmpty())
         return;
-    // 仅对新收到的数据按当前 hexReceive 开关决定显示格式；
+    // 仅对新收到的数据按当前两个十六进制接收开关决定显示格式；
+    // 两个开关在 setter 内已互斥，所以这里最多只有一个为 true。
     // 之前已收到的数据保持原样（不做二次转换）。
-    const QString display = m_hexReceive ? bytesToHex(raw)
-                                         : QString::fromUtf8(raw);
+    QString display;
+    if (m_hexReceiveNoSpace)
+        display = bytesToHexNoSpace(raw);
+    else if (m_hexReceive)
+        display = bytesToHex(raw);
+    else
+        display = QString::fromUtf8(raw);
     appendLog(display, true);
 }
 

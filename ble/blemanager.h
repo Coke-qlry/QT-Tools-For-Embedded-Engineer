@@ -16,6 +16,7 @@
 
 #include "blepermissions.h"
 #include "bleterminal.h"
+#include "debug_checkbox_status_control.h"
 
 class BleScanner;
 class BleAdvertiser;
@@ -36,6 +37,9 @@ class BleManager : public QObject
     Q_PROPERTY(BlePermissions *permissions READ permissions CONSTANT)
     // 调试终端模块（数据收发 / 十六进制 / 定时发送 / 导出）
     Q_PROPERTY(BleTerminal *terminal READ terminal CONSTANT)
+    // 调试页 CheckBox 状态 + 已绑定设备仓库（SQLite 持久化）
+    Q_PROPERTY(DebugCheckboxStatusControl *checkboxControl
+               READ checkboxControl CONSTANT)
 
 public:
     explicit BleManager(QObject *parent = nullptr);
@@ -54,6 +58,8 @@ public:
     BlePermissions *permissions() const;
     // 返回调试终端对象（QML 通过 bleManager.terminal 访问）
     BleTerminal *terminal() const;
+    // 返回 CheckBox 状态 / 已绑定设备仓库（QML 通过 bleManager.checkboxControl 访问）
+    DebugCheckboxStatusControl *checkboxControl() const;
 
     // ---- 权限辅助（转发到 BlePermissions）----
     Q_INVOKABLE bool hasPermission(int permission) const;
@@ -103,6 +109,9 @@ signals:
     void peripheralDataReceived(const QByteArray &data);
     void deviceFound(const QString &name, const QString &address,
                      int rssi, bool isLe);
+    // 扫描发现已绑定设备 → QML 收到后可触发自动连接（避免在 C++ 中静默
+    // 连接打断用户当前正在做的操作，例如正在调试或正在扫描其它设备）
+    void boundDeviceFound(const QString &name, const QString &address);
     void scanFinished();
     void servicesDiscovered(const QVariantList &services);
     void detailsDiscovered(const QString &serviceUuid);
@@ -121,4 +130,5 @@ private:
     BleAdvertiser *m_advertiser = nullptr;
     BleConnection *m_connection = nullptr;
     BleTerminal *m_terminal = nullptr;
+    DebugCheckboxStatusControl *m_checkboxControl = nullptr;
 };

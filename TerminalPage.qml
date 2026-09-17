@@ -15,6 +15,17 @@ Item {
     // 服务与特征面板是否展开（仅本页使用）
     property bool gattOpen: false
 
+    // 「绑定此设备」勾选框状态：双向桥接到 DebugCheckboxStatusControl，
+    // 让 Main.qml 启动时从 SQLite 仓库回填，用户切换时落库。
+    // 注：bindCurrentChecked 是 UI 层的临时状态，真正持久化通过
+    // bleManager.checkboxControl.bindCurrentDevice 完成。
+    property bool bindCurrentChecked: false
+    // 最近一次「绑定此设备」勾选时所绑定设备的小写 MAC 地址。
+    // 与 bindCurrentChecked 同步维护，用于让 BindPage 解除绑定时
+    // 能准确判定「被解绑的就是当前勾选的这台」—— 仅靠 app.targetAddress
+    // 判定太脆弱（断连/切设备后值会变），用本页维护的勾选地址更可靠。
+    property string currentBoundAddress: ""
+
     // 调试页「服务与特征」目录（字段由 BleTerminal::charCatalog 返回：
     // serviceUuid/serviceName/charUuid/charName/properties/
     // writable/readable/notifiable/notifyOn/isSendTarget）
@@ -625,8 +636,14 @@ Item {
             }
         }
 
-        // 勾选框（Flow：空间不足时自动换行）
-        Flow {
+        // 勾选框（两组独立 Flow：每组内部按需换行，跨组不会溢出重叠）
+        // 第 1 组：十六进制发送 / 接收(带空格) / 接收(不带空格)
+        // 第 2 组：定时发送 / 时间戳
+        // 设计要点：把 5 个按钮分到两个独立 Flow 里，避免单个 Flow 把
+        // 后面组别的按钮排进同一行；每个 CheckBox 的 width 都按
+        // 「文本实际宽度 + indicator + padding」精确预留，杜绝
+        // 「定时发送的勾选框遮住十六进制接收(不带空格)文本」的问题。
+        Column {
             id: chkRow
             anchors.bottom: parent.bottom
             anchors.left: parent.left
@@ -634,13 +651,113 @@ Item {
             height: chkRow.implicitHeight
             spacing: 6
 
+            // ---- 第 0 组：「绑定此设备」独立行（功能较重，单独一行更醒目）----
+            // 勾选后把当前连接的设备地址/名称写入仓库，下一次扫描到时自动连接；
+            // 取消勾选时如果之前绑定过，自动解绑，与「绑定」页的解除绑定按钮等效。
+            CheckBox {
+                id: bindCurrentBox
+                width: 116
+                height: 26
+                text: "绑定此设备"
+                checked: page.bindCurrentChecked
+                enabled: bleManager.terminal.active
+                          || (bleManager.connected && bleManager.targetAddress !== "")
+                onToggled: {
+                    page.bindCurrentChecked = checked
+                    var ctl = bleManager.checkboxControl
+                    if (!ctl) return
+                    // 当前连接目标地址由 Main.qml 的 root.targetAddress 管理
+                    var addr = String(app.targetAddress || "").trim()
+                    if (checked) {
+                        // 必须有连接地址才允许绑定；否则不落库
+                        if (addr === "") {
+                            checked = false
+                            page.bindCurrentChecked = false
+                            app.showToast("请先连接一个设备")
+                            return
+                        }
+                        // 同步记录当前被勾选绑定的设备地址（小写归一化），
+                        // 让 BindPage 解除绑定时能精准匹配。
+                        page.currentBoundAddress = addr.toLowerCase()
+                        // 设备名：优先从 Main.qml 的扫描列表中查找，
+                        // 查不到则用 MAC 截断作为占位（避免空名入库）。
+                        var nm = "N/A"
+                        try {
+                            if (app && app.deviceModel) {
+                                for (var i = 0; i < app.deviceModel.count; i++) {
+                                    var it = app.deviceModel.get(i)
+                                    if (it && String(it.address || "")
+                                            .toLowerCase() === addr.toLowerCase()) {
+                                        nm = String(it.name || "").trim()
+                                        break
+                                    }
+                                }
+                            }
+                        } catch (e) { nm = "N/A" }
+                        if (!nm || nm === "") {
+                            // 用 MAC 末 5 位做占位名（保留可读性）
+                            nm = addr.length >= 5
+                                  ? ("设备-" + addr.substr(addr.length - 5).toUpperCase())
+                                  : "设备"
+                        }
+                        if (ctl.bindDevice(nm, addr)) {
+                            ctl.bindCurrentDevice = true
+                            app.showToast("已绑定当前设备：" + nm)
+                        } else {
+                            checked = false
+                            page.bindCurrentChecked = false
+                            app.showToast("绑定失败")
+                        }
+                    } else {
+                        // 取消勾选：解除绑定（与「绑定」页解除绑定按钮等效）
+                        if (addr !== "" && ctl.isBound(addr)) {
+                            ctl.unbindDevice(addr)
+                            app.showToast("已解除绑定当前设备")
+                        }
+                        ctl.bindCurrentDevice = false
+                        // 同步清空「当前勾选地址」，避免下次勾选别的设备时残留旧地址
+                        page.currentBoundAddress = ""
+                    }
+                }
+                indicator: Rectangle {
+                    implicitWidth: 18
+                    implicitHeight: 18
+                    radius: 4
+                    color: parent.checked ? app.cAccent : app.cSurface2
+                    border.color: parent.checked ? app.cAccent : app.cDivider
+                    Text {
+                        anchors.centerIn: parent
+                        text: "✓"
+                        visible: parent.parent.checked
+                        color: "white"
+                        font.pixelSize: 12
+                    }
+                }
+                contentItem: Text {
+                    text: parent.text
+                    font.pixelSize: 12
+                    color: app.cText
+                    leftPadding: parent.indicator.width + 6
+                    verticalAlignment: Text.AlignVCenter
+                }
+            }
+
+            // ---- 第 1 组：三个十六进制相关开关 ----
+            Flow {
+                width: parent.width
+                spacing: 6
             CheckBox {
                 id: hexSendBox
-                width: 106
+                width: 100
                 height: 26
                 text: "十六进制发送"
                 checked: bleManager.terminal.hexSend
-                onToggled: bleManager.terminal.hexSend = checked
+                onToggled: {
+                    bleManager.terminal.hexSend = checked
+                    // 持久化到仓库，下次启动自动还原
+                    if (bleManager.checkboxControl)
+                        bleManager.checkboxControl.hexSend = checked
+                }
                 indicator: Rectangle {
                     implicitWidth: 18
                     implicitHeight: 18
@@ -666,11 +783,23 @@ Item {
 
             CheckBox {
                 id: hexRecvBox
-                width: 112
+                width: 142
                 height: 26
-                text: "十六进制接收"
+                text: "十六进制接收(带空格)"
                 checked: bleManager.terminal.hexReceive
-                onToggled: bleManager.terminal.hexReceive = checked
+                onToggled: {
+                    bleManager.terminal.hexReceive = checked
+                    // 互斥：勾选带空格时取消无空格
+                    if (checked) {
+                        bleManager.terminal.hexReceiveNoSpace = false
+                        hexRecvNoSpaceBox.checked = false
+                    }
+                    // 持久化到仓库（两个接收开关是互斥的，只需持久化当前状态）
+                    var ctl = bleManager.checkboxControl
+                    if (!ctl) return
+                    ctl.hexReceiveSpaced = checked
+                    if (checked) ctl.hexReceiveNoSpace = false
+                }
                 indicator: Rectangle {
                     implicitWidth: 18
                     implicitHeight: 18
@@ -695,8 +824,56 @@ Item {
             }
 
             CheckBox {
+                id: hexRecvNoSpaceBox
+                width: 158
+                height: 26
+                text: "十六进制接收(不带空格)"
+                checked: bleManager.terminal.hexReceiveNoSpace
+                onToggled: {
+                    bleManager.terminal.hexReceiveNoSpace = checked
+                    // 互斥：勾选不带空格时取消带空格
+                    if (checked) {
+                        bleManager.terminal.hexReceive = false
+                        hexRecvBox.checked = false
+                    }
+                    // 持久化到仓库（两个接收开关是互斥的，只需持久化当前状态）
+                    var ctl = bleManager.checkboxControl
+                    if (!ctl) return
+                    ctl.hexReceiveNoSpace = checked
+                    if (checked) ctl.hexReceiveSpaced = false
+                }
+                indicator: Rectangle {
+                    implicitWidth: 18
+                    implicitHeight: 18
+                    radius: 4
+                    color: parent.checked ? app.cAccent : app.cSurface2
+                    border.color: parent.checked ? app.cAccent : app.cDivider
+                    Text {
+                        anchors.centerIn: parent
+                        text: "✓"
+                        visible: parent.parent.checked
+                        color: "white"
+                        font.pixelSize: 12
+                    }
+                }
+                contentItem: Text {
+                    text: parent.text
+                    font.pixelSize: 12
+                    color: app.cText
+                    leftPadding: parent.indicator.width + 6
+                    verticalAlignment: Text.AlignVCenter
+                }
+            }
+            }
+
+            // ---- 第 2 组：定时发送 + 时间戳 ----
+            Flow {
+                width: parent.width
+                spacing: 6
+
+            CheckBox {
                 id: timerSendBox
-                width: 88
+                width: 80
                 height: 26
                 text: "定时发送"
                 onToggled: {
@@ -736,11 +913,16 @@ Item {
 
             CheckBox {
                 id: tsBox
-                width: 84
+                width: 72
                 height: 26
                 text: "时间戳"
                 checked: bleManager.terminal.timestampEnabled
-                onToggled: bleManager.terminal.timestampEnabled = checked
+                onToggled: {
+                    bleManager.terminal.timestampEnabled = checked
+                    // 持久化到仓库
+                    if (bleManager.checkboxControl)
+                        bleManager.checkboxControl.timestampEnabled = checked
+                }
                 indicator: Rectangle {
                     implicitWidth: 18
                     implicitHeight: 18
@@ -762,6 +944,7 @@ Item {
                     leftPadding: parent.indicator.width + 6
                     verticalAlignment: Text.AlignVCenter
                 }
+            }
             }
         }
 

@@ -16,16 +16,30 @@ BleManager::BleManager(QObject *parent)
     m_advertiser = new BleAdvertiser(this);
     m_connection = new BleConnection(this);
     m_terminal = new BleTerminal(this);
+    // 调试页 CheckBox 状态 + 已绑定设备仓库（SQLite 持久化）
+    m_checkboxControl = new DebugCheckboxStatusControl(this);
+    m_checkboxControl->initialize();
 
     // 扫描模块信号转发
     connect(m_scanner, &BleScanner::deviceFound,
             this, &BleManager::deviceFound);
+    connect(m_scanner, &BleScanner::boundDeviceDiscovered,
+            this, &BleManager::boundDeviceFound);
     connect(m_scanner, &BleScanner::scanningChanged,
             this, &BleManager::scanningChanged);
     connect(m_scanner, &BleScanner::scanFinished,
             this, &BleManager::scanFinished);
     connect(m_scanner, &BleScanner::errorOccurred,
             this, &BleManager::errorOccurred);
+
+    // 已绑定设备列表变化时刷新 Scanner 的自动连接候选集；
+    // 例如在「绑定」页解绑设备后立刻生效，下次扫描不会再触发该地址的自动连接
+    connect(m_checkboxControl, &DebugCheckboxStatusControl::boundDevicesChanged,
+            this, [this]() {
+        m_scanner->setBoundAddresses(m_checkboxControl->boundAddresses());
+    });
+    // 启动后立即同步一次当前已绑定地址
+    m_scanner->setBoundAddresses(m_checkboxControl->boundAddresses());
 
     // 广播模块信号转发
     connect(m_advertiser, &BleAdvertiser::advertisingChanged,
@@ -107,6 +121,11 @@ BlePermissions *BleManager::permissions() const
 BleTerminal *BleManager::terminal() const
 {
     return m_terminal;
+}
+
+DebugCheckboxStatusControl *BleManager::checkboxControl() const
+{
+    return m_checkboxControl;
 }
 
 bool BleManager::hasPermission(int permission) const

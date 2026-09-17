@@ -25,6 +25,9 @@ qt_add_executable(appBLE_SAR
     ble/blepermissions.cpp
     ble/bleterminal.h
     ble/bleterminal.cpp
+    # ---- 调试页 CheckBox 状态 & 已绑定设备仓库（SQLite） ----
+    ble/debug_checkbox_status_control.h
+    ble/debug_checkbox_status_control.cpp
     # ---- SQLite 配置仓库模块（通用可复用） ----
     sqlite/SQLite.h
     sqlite/SQLite.cpp
@@ -39,6 +42,7 @@ qt_add_qml_module(appBLE_SAR
         AdvertisePage.qml
         TerminalPage.qml
         CommandPage.qml
+        BindPage.qml
         AboutPage.qml
     RESOURCES
         icons/tubiao.png

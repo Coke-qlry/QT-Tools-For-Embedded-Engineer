@@ -39,8 +39,13 @@ class BleTerminal : public QObject
     // 会话是否可用（主动连接从设备 / 外设被其它设备连接）
     Q_PROPERTY(bool active READ active NOTIFY activeChanged)
     // 十六进制接收 / 发送开关
+    // hexReceive=true + hexReceiveNoSpace=false：十六进制带空格（如 01 A0 FF）
+    // hexReceive=true + hexReceiveNoSpace=true ：十六进制不带空格（如 01A0FF）
+    // 两个开关同时为 false 时按原文(UTF-8)显示
     Q_PROPERTY(bool hexReceive READ hexReceive WRITE setHexReceive
                NOTIFY hexReceiveChanged)
+    Q_PROPERTY(bool hexReceiveNoSpace READ hexReceiveNoSpace
+               WRITE setHexReceiveNoSpace NOTIFY hexReceiveNoSpaceChanged)
     Q_PROPERTY(bool hexSend READ hexSend WRITE setHexSend
                NOTIFY hexSendChanged)
     // 定时发送状态（开启后由 C++ 定时器驱动，持续到点自动关闭）
@@ -69,6 +74,8 @@ public:
     bool active() const { return m_active; }
     bool hexReceive() const { return m_hexReceive; }
     void setHexReceive(bool on);
+    bool hexReceiveNoSpace() const { return m_hexReceiveNoSpace; }
+    void setHexReceiveNoSpace(bool on);
     bool hexSend() const { return m_hexSend; }
     void setHexSend(bool on);
     bool timerEnabled() const { return m_timerEnabled; }
@@ -133,6 +140,8 @@ public:
     static QByteArray parseHex(const QString &text, bool *ok);
     // 字节流转十六进制显示串：大写、空格分隔
     static QString bytesToHex(const QByteArray &data);
+    // 字节流转无空格十六进制显示串：大写、连续拼接（如 01A0FF）
+    static QString bytesToHexNoSpace(const QByteArray &data);
 
 signals:
     void receivedTextChanged();
@@ -142,6 +151,7 @@ signals:
     void dataLogged(const QString &display, bool receive);
     void activeChanged();
     void hexReceiveChanged();
+    void hexReceiveNoSpaceChanged();
     void hexSendChanged();
     void timerEnabledChanged();
     void timestampEnabledChanged();
@@ -231,6 +241,7 @@ private:
     bool m_peripheral = false;
     bool m_active = false;
     bool m_hexReceive = false;
+    bool m_hexReceiveNoSpace = false;
     bool m_hexSend = false;
     bool m_timerEnabled = false;
     bool m_timestampEnabled = false;

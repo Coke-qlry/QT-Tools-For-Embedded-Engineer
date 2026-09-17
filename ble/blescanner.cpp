@@ -93,6 +93,11 @@ void BleScanner::startScan(int timeoutMs)
     // 导致新扫描只能看到"本轮新增"的设备。
     clear();
 
+    // 重置本轮扫描内的"已自动连接"去重集合：每一轮扫描允许再次触发
+    // 自动连接（用户可能切换设备或暂时离开后又回来），但同一轮内
+    // 同一地址只连一次，避免重复骚扰。
+    m_autoConnectedThisScan.clear();
+
     if (timeoutMs > 0)
         m_agent->setLowEnergyDiscoveryTimeout(timeoutMs);
 
@@ -125,7 +130,27 @@ void BleScanner::onDeviceDiscovered(const QBluetoothDeviceInfo &info)
     m_addresses.insert(address);
 
     m_infos.append(info);
-    emit deviceFound(displayName(info), address, info.rssi(), isLeDevice(info));
+    const QString name = displayName(info);
+    emit deviceFound(name, address, info.rssi(), isLeDevice(info));
+
+    // 命中已绑定列表：本轮扫描内仅触发一次自动连接
+    const QString addrLower = address.toLower();
+    if (!m_boundAddresses.isEmpty()
+        && m_boundAddresses.contains(addrLower)
+        && !m_autoConnectedThisScan.contains(addrLower)) {
+        m_autoConnectedThisScan.insert(addrLower);
+        emit boundDeviceDiscovered(name, address);
+    }
+}
+
+void BleScanner::setBoundAddresses(const QStringList &addresses)
+{
+    // 小写归一化后再写入，与 boundDeviceDiscovered 触发处的处理保持一致
+    m_boundAddresses.clear();
+    for (const QString &a : addresses) {
+        const QString k = a.trimmed().toLower();
+        if (!k.isEmpty()) m_boundAddresses.insert(k);
+    }
 }
 
 void BleScanner::onScanFinished()

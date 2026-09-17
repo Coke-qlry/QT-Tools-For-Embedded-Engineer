@@ -43,7 +43,7 @@ Window {
     readonly property color cOrange:    "#F39C12"
 
     // ---------------- 状态 ----------------
-    property int currentTab: 0          // 0=扫描 1=广播 2=调试 3=指令 4=关于
+    property int currentTab: 0          // 0=扫描 1=广播 2=调试 3=指令 4=绑定 5=关于
     property bool scanning: false       // 由 bleManager.scanningChanged 驱动
     property bool advertising: false    // 由 bleManager.advertisingChanged 驱动
     property bool peripheralConnected: false // 外设被其它设备连接状态
@@ -51,6 +51,9 @@ Window {
     property string targetAddress: ""   // 当前连接目标设备地址
     property string connectingAddress: "" // 正在连接中(尚未成功)的设备地址，空=当前无进行中的连接
     property var pendingAction: null    // 权限授权成功后待执行的动作
+    // 已绑定设备数量（驱动导航栏"绑定"Tab 的角标）
+    property int bindBadgeCount: bleManager.checkboxControl
+                                ? bleManager.checkboxControl.boundDeviceCount : 0
     // 连接失败后短暂抑制后续补充信号的时刻戳(毫秒)：Android 上连接失败可能
     // errorOccurred 与 disconnected 先后到达，避免弹两次提示
     property var suppressErrUntil: 0
@@ -79,11 +82,34 @@ Window {
         // 自定义指令库：启动即准备 ble_command_config（首次运行时自动建库
         // 并写入出厂默认指令；之后每次启动加载用户上一次保存的配置）
         commandPage.initFromSqlite()
+        // 启动时把 SQLite 仓库里保存的「调试页 CheckBox 状态」回写到
+        // BleTerminal 各属性上，让用户上一次配置的开关/格式偏好生效
+        applyDebugCheckboxStatuses()
         autoScanTimer.start()
         // 页面就绪后刷新一次系统蓝牙名称：已有权限时立即显示真实名称，
         // 未授权时保持占位名，权限授予后由 onPermissionGranted 再次刷新。
         // （避免在 app 启动早期、权限弹窗前执行蓝牙 JNI，防止首次安装闪退）
         bleManager.refreshLocalDeviceName()
+    }
+
+    // 把仓库里保存的 CheckBox 状态一次性同步到 BleTerminal 的对应属性。
+    // 仅设置一次，避免在用户后续手动切换时又被覆盖。
+    // 注意：定时发送状态故意不持久化（按用户要求）。
+    function applyDebugCheckboxStatuses() {
+        var ctl = bleManager.checkboxControl
+        if (!ctl) return
+        bleManager.terminal.hexSend         = ctl.hexSend
+        bleManager.terminal.hexReceive      = ctl.hexReceiveSpaced
+        bleManager.terminal.hexReceiveNoSpace = ctl.hexReceiveNoSpace
+        bleManager.terminal.timestampEnabled = ctl.timestampEnabled
+        // hexReceive 在 BleTerminal 里两个开关是互斥的（C++ setter 已处理），
+        // 如果仓库里两个都保存为 true（异常情况），保留 spaced 让无空格被自动关闭。
+        if (bleManager.terminal.hexReceive && bleManager.terminal.hexReceiveNoSpace) {
+            bleManager.terminal.hexReceiveNoSpace = false
+            ctl.hexReceiveNoSpace = false
+        }
+        // 绑定此设备的勾选状态（启动时还原上次选择）
+        terminalPage.bindCurrentChecked = ctl.bindCurrentDevice
     }
     Timer {
         id: autoScanTimer
@@ -379,10 +405,19 @@ Window {
             anchors.right: parent.right
             anchors.bottom: bottomNav.top
         }
+        BindPage {
+            id: bindPage
+            app: root
+            visible: root.currentTab === 4
+            anchors.top: parent.top
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: bottomNav.top
+        }
         AboutPage {
             id: aboutPage
             app: root
-            visible: root.currentTab === 4
+            visible: root.currentTab === 5
             anchors.top: parent.top
             anchors.left: parent.left
             anchors.right: parent.right
@@ -411,34 +446,71 @@ Window {
                         { label: "广播(Advert)",  icon: "📢" },
                         { label: "调试(Debug)",   icon: "🔧" },
                         { label: "指令(Commands)", icon: "⚙" },
+                        { label: "绑定(Bind)",    icon: "🔗" },
                         { label: "关于(About)",   icon: "ℹ" }
                     ]
                     delegate: Item {
-                        width: bottomNav.width / 5
+                        width: bottomNav.width / 6
                         height: bottomNav.height
                         MouseArea {
                             anchors.fill: parent
                             onClicked: root.currentTab = index
                         }
+                        // 6 个 Tab 用一致的「顶部锚定 + 固定单元高度」布局，
+                        // 强制把图标与标签的 baseline 锁在同一 y 坐标，避免
+                        // 不同 emoji 字符 implicitHeight 差异造成的视觉错位
                         Column {
-                            anchors.centerIn: parent
+                            anchors.top: parent.top
+                            anchors.topMargin: 6
+                            anchors.horizontalCenter: parent.horizontalCenter
                             spacing: 2
+                            // 图标：固定容器高度 22，文字垂直居中，
+                            // 6 个 Tab 的图标 baseline 都落在同一 y
                             Text {
-                                width: bottomNav.width / 5
+                                width: bottomNav.width / 6 - 4
+                                height: 22
                                 text: modelData.icon
                                 font.pixelSize: 18
                                 color: root.currentTab === index ? root.cAccent : root.cSubtext
                                 horizontalAlignment: Text.AlignHCenter
                                 verticalAlignment: Text.AlignVCenter
                             }
+                            // 标签：固定容器高度 14，文字垂直居中，
+                            // 6 个 Tab 的标签 baseline 都落在同一 y
                             Text {
-                                width: bottomNav.width / 5 - 8
+                                width: bottomNav.width / 6 - 4
+                                height: 14
                                 text: modelData.label
                                 font.pixelSize: 11
                                 color: root.currentTab === index ? root.cAccent : root.cSubtext
                                 font.bold: root.currentTab === index
                                 horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
                                 elide: Text.ElideRight
+                            }
+                        }
+                        // 绑定 Tab 角标：放在 Column 之外作为浮层（绝对定位
+                        // 叠加在图标右上角），不参与 Column 布局，避免
+                        // visible=true 时撑开 Column 高度、把标签向下推
+                        // 导致与其它 5 个 Tab 不对齐。
+                        Rectangle {
+                            visible: index === 4 && root.bindBadgeCount > 0
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            anchors.horizontalCenterOffset: 9
+                            anchors.top: parent.top
+                            anchors.topMargin: -2
+                            width: bindBadgeText.implicitWidth + 10
+                            height: 16
+                            radius: 8
+                            color: root.cRed
+                            z: 5
+                            Text {
+                                id: bindBadgeText
+                                anchors.centerIn: parent
+                                text: root.bindBadgeCount
+                                color: "white"
+                                font.pixelSize: 9
+                                font.bold: true
                             }
                         }
                     }
@@ -530,6 +602,21 @@ Window {
                 root.logDisconnected()
                 root.showToast("已断开连接")
             }
+        }
+        // 扫描时发现已绑定设备 → 自动连接（如果当前空闲，未在连接中或已连接）
+        function onBoundDeviceFound(name, address) {
+            if (bleManager.connected || bleManager.peripheralConnected) return
+            if (root.connectingAddress !== "") return
+            root.showToast("检测到已绑定设备：" + name + "，正在自动连接…")
+            root.connectToDeviceByAddress(address)
+        }
+    }
+
+    // CheckBox 状态 / 已绑定设备仓库变化：刷新导航栏角标
+    Connections {
+        target: bleManager.checkboxControl
+        function onBoundDevicesChanged() {
+            root.bindBadgeCount = bleManager.checkboxControl.boundDeviceCount
         }
     }
 

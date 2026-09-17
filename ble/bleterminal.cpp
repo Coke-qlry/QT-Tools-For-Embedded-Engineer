@@ -127,6 +127,21 @@ BleTerminal::BleTerminal(BleManager *manager, QObject *parent)
 // ---------------------------------------------------------------------
 // 十六进制工具
 // ---------------------------------------------------------------------
+namespace {
+// 单个 ASCII 字符的十六进制数值（0-15），非法字符返回 -1。
+// 注意：不能用 QChar::digitValue(16) —— QChar 没有 base 参数重载，
+// 该写法实际调用的是静态函数 QChar::digitValue(char32_t)，会去求
+// “码点 16 这个字符”的数字值（恒为 -1），导致任何输入都判为非法。
+int hexDigitValue(const QChar &ch)
+{
+    const ushort u = ch.unicode();
+    if (u >= u'0' && u <= u'9') return u - u'0';
+    if (u >= u'A' && u <= u'F') return u - u'A' + 10;
+    if (u >= u'a' && u <= u'f') return u - u'a' + 10;
+    return -1;
+}
+} // namespace
+
 QByteArray BleTerminal::parseHex(const QString &text, bool *ok)
 {
     if (ok)
@@ -135,7 +150,7 @@ QByteArray BleTerminal::parseHex(const QString &text, bool *ok)
     QString cleaned;
     cleaned.reserve(text.size());
     for (const QChar &ch : text) {
-        if (ch.digitValue(16) >= 0) {           // 0-9 A-F a-f
+        if (hexDigitValue(ch) >= 0) {           // 0-9 A-F a-f
             cleaned += ch;
         } else if (!(ch.isSpace()
                      || ch == QLatin1Char(',')
@@ -151,8 +166,8 @@ QByteArray BleTerminal::parseHex(const QString &text, bool *ok)
 
     QByteArray out(cleaned.size() / 2, Qt::Uninitialized);
     for (int i = 0; i < cleaned.size(); i += 2) {
-        out[i / 2] = char((cleaned[i].digitValue(16) << 4)
-                          | cleaned[i + 1].digitValue(16));
+        out[i / 2] = char((hexDigitValue(cleaned[i]) << 4)
+                          | hexDigitValue(cleaned[i + 1]));
     }
     if (ok)
         *ok = true;

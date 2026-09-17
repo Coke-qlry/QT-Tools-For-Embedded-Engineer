@@ -88,6 +88,11 @@ void BleScanner::startScan(int timeoutMs)
     if (m_scanning)
         return;
 
+    // 开始新一轮扫描前先清空上一轮的发现缓存：
+    // 否则先前发现过的设备会因地址去重被直接忽略、不再上报，
+    // 导致新扫描只能看到"本轮新增"的设备。
+    clear();
+
     if (timeoutMs > 0)
         m_agent->setLowEnergyDiscoveryTimeout(timeoutMs);
 
